@@ -1,0 +1,49 @@
+# Obsidian terminal chat bot (IMAGE MODE)
+# - Business code lives in the image layer (see image/Dockerfile and bot/chat_once.py).
+# - agent.claw only declares runtime policy, mounts, and startup command.
+# - API keys are runtime-injected via --llm-api-key-env (never stored in file).
+# - Keep host data outside vault to avoid overlapping mount bypass.
+apiVersion: metaclaw/v1
+kind: Agent
+agent:
+  name: obsidian-terminal-bot
+  species: micro
+  lifecycle: ephemeral
+
+  habitat:
+    network:
+      mode: none
+    mounts:
+      - source: /ABS/PATH/TO/OBSIDIAN_VAULT
+        target: /vault
+        readOnly: true
+      - source: /ABS/PATH/TO/BOT_HOST_DATA/config
+        target: /config
+        readOnly: true
+      - source: /ABS/PATH/TO/BOT_HOST_DATA/logs
+        target: /logs
+      - source: /ABS/PATH/TO/BOT_HOST_DATA/runtime
+        target: /runtime
+      - source: /ABS/PATH/TO/BOT_HOST_DATA/workspace
+        target: /workspace
+
+    env:
+      OBSIDIAN_VAULT_DIR: /vault
+      METACLAW_CONFIG_DIR: /config
+      METACLAW_LOG_DIR: /logs
+      METACLAW_RUNTIME_DIR: /runtime
+      METACLAW_WORKSPACE_DIR: /workspace
+
+  llm:
+    provider: gemini_openai
+    model: gemini-3-flash-preview
+    baseURL: https://generativelanguage.googleapis.com/v1beta/openai/
+    apiKeyEnv: GEMINI_API_KEY
+
+  runtime:
+    # Updated by ./build_image.sh after local build
+    image: metaclaw/obsidian-terminal-bot:local@sha256:033f3cfb45b3343fb997525a8ce14b87f711c7db221d9a0d287cd87be81eafee
+
+  command:
+    - python3
+    - /app/chat_once.py
