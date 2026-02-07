@@ -9,6 +9,15 @@ This repo contains only example projects.
 - includes: demo `agent.claw`, sample bot code, example build/run scripts
 - excludes: engine internals, reusable skill library governance, registry backend services
 
+## Ecosystem Repo Map
+
+| Repo | Primary Responsibility | URL |
+| --- | --- | --- |
+| `metaclaw` | Engine core: compiler, runtime adapters, lifecycle/state | https://github.com/fpp-125/metaclaw |
+| `metaclaw-examples` | Runnable end-to-end examples and starter templates | https://github.com/fpp-125/metaclaw-examples |
+| `metaclaw-skills` | Reusable capabilities (`SKILL.md` + `capability.contract`) | https://github.com/fpp-125/metaclaw-skills |
+| `metaclaw-registry` | Publish/distribution backend for skill/capsule metadata | https://github.com/fpp-125/metaclaw-registry |
+
 ## Included
 
 - `examples/obsidian-bot/`
