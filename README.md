@@ -44,6 +44,50 @@ export TAVILY_API_KEY=...
 ./chat.sh
 ```
 
+### Friend Setup (Engine + Advanced Bot)
+
+```bash
+# 0) Clone both repos
+git clone https://github.com/fpp-125/metaclaw.git
+git clone https://github.com/fpp-125/metaclaw-examples.git
+
+# 1) Build the engine binary
+cd metaclaw
+go build -o ./metaclaw ./cmd/metaclaw
+
+# 2) Enter the advanced Obsidian bot example
+cd ../metaclaw-examples/examples/obsidian-terminal-bot-advanced
+
+# 3) Prepare host data directories
+BOT_DATA="$HOME/.metaclaw/obsidian-terminal-bot"
+mkdir -p "$BOT_DATA"/{config,logs,runtime,workspace}
+```
+
+Then do two things:
+
+- Edit `agent.claw`.
+- Replace `/ABS/PATH/TO/OBSIDIAN_VAULT` with your friend's vault path.
+- Replace `/ABS/PATH/TO/BOT_HOST_DATA` with the absolute path of `BOT_DATA`.
+- Build and run:
+
+```bash
+# 4) Build image (choose one runtime)
+RUNTIME_BIN=container ./build_image.sh
+# RUNTIME_BIN=docker ./build_image.sh
+# RUNTIME_BIN=podman ./build_image.sh
+
+# 5) Set API keys and run
+export GEMINI_API_KEY='...'
+export TAVILY_API_KEY='...'   # optional
+
+METACLAW_BIN="/ABS/PATH/TO/metaclaw/metaclaw" \
+RUNTIME_TARGET=apple_container \
+./chat.sh
+# or set RUNTIME_TARGET=docker / podman
+```
+
+If `metaclaw` is already in your `PATH`, you can omit `METACLAW_BIN=...`.
+
 ### Minimal Obsidian starter
 
 ```bash
