@@ -1,0 +1,10 @@
+# Local runtime state
+**/.metaclaw/
+
+# Optional runtime content
+**/vault/*
+**/logs/*
+
+# Keep directory structure placeholders
+!**/vault/.gitkeep
+!**/logs/.gitkeep
