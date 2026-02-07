@@ -1,0 +1,17 @@
+apiVersion: metaclaw/v1
+kind: Agent
+agent:
+  name: capsule-release-demo
+  species: nano
+  lifecycle: ephemeral
+  habitat:
+    network:
+      mode: none
+    mounts: []
+    env: {}
+  runtime:
+    image: alpine:3.20@sha256:a4f4213abb84c497377b8544c81b3564f313746700372ec4fe84653e4fb03805
+  command:
+    - sh
+    - -lc
+    - echo "capsule release demo"

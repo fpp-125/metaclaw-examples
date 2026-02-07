@@ -10,12 +10,12 @@ agent:
         network:
             mode: outbound
         mounts:
-            - source: ./examples/obsidian-bot/vault
+            - source: /ABS/PATH/TO/obsidian-bot/vault
               target: /vault
-            - source: ./examples/obsidian-bot/config
+            - source: /ABS/PATH/TO/obsidian-bot/config
               target: /config
               readOnly: true
-            - source: ./examples/obsidian-bot/logs
+            - source: /ABS/PATH/TO/obsidian-bot/logs
               target: /logs
         env:
             METACLAW_CONFIG_DIR: /config
