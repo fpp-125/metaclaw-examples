@@ -8,9 +8,31 @@ Community and starter examples for MetaClaw.
 
 ## Quick Start
 
+### Option A: Gemini (OpenAI-compatible endpoint)
+
 ```bash
 export GEMINI_API_KEY=...
 metaclaw run examples/obsidian-bot/agent.claw --llm-api-key-env=GEMINI_API_KEY
+```
+
+### Option B: OpenAI-compatible provider
+
+Update `examples/obsidian-bot/agent.claw`:
+
+```yaml
+agent:
+  llm:
+    provider: openai_compatible
+    model: gpt-4.1-mini
+    baseURL: https://api.openai.com/v1
+    apiKeyEnv: OPENAI_API_KEY
+```
+
+Then run:
+
+```bash
+export OPENAI_API_KEY=...
+metaclaw run examples/obsidian-bot/agent.claw --llm-api-key-env=OPENAI_API_KEY
 ```
 
 Notes:
