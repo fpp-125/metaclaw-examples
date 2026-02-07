@@ -16,6 +16,7 @@
       .h { font: 700 43px 'Avenir Next', 'Segoe UI', sans-serif; fill: #f8fafc; }
       .name { font: 700 27px 'Avenir Next', 'Segoe UI', sans-serif; fill: #f8fafc; }
       .desc { font: 600 18px 'Avenir Next', 'Segoe UI', sans-serif; fill: #f1f5f9; }
+      .meta { font: 500 14px 'Avenir Next', 'Segoe UI', sans-serif; fill: #e2e8f0; }
     </style>
   </defs>
 
@@ -25,19 +26,27 @@
   <rect x="54" y="58" width="1292" height="274" rx="26" fill="#011634" opacity="0.95" filter="url(#shadow)"/>
   <text x="118" y="122" class="h">Ecosystem Repos</text>
 
-  <rect x="118" y="154" width="284" height="138" rx="18" fill="#2b4ec2"/>
-  <text x="138" y="192" class="name">metaclaw</text>
-  <text x="138" y="226" class="desc">Engine core</text>
+  <rect x="118" y="146" width="284" height="154" rx="18" fill="#2b4ec2"/>
+  <text x="138" y="184" class="name">metaclaw</text>
+  <text x="138" y="212" class="desc">Engine core</text>
+  <text x="138" y="236" class="meta">Compiler + RuntimeAdapter</text>
+  <text x="138" y="258" class="meta">Policy, capsule, lifecycle state</text>
 
-  <rect x="420" y="154" width="284" height="138" rx="18" fill="#1a7773"/>
-  <text x="440" y="192" class="name">metaclaw-examples</text>
-  <text x="440" y="226" class="desc">Runnable templates</text>
+  <rect x="420" y="146" width="284" height="154" rx="18" fill="#1a7773"/>
+  <text x="440" y="184" class="name">metaclaw-examples</text>
+  <text x="440" y="212" class="desc">Runnable templates</text>
+  <text x="440" y="236" class="meta">End-to-end starter projects</text>
+  <text x="440" y="258" class="meta">Reference bot implementations</text>
 
-  <rect x="722" y="154" width="284" height="138" rx="18" fill="#aa5511"/>
-  <text x="742" y="192" class="name">metaclaw-skills</text>
-  <text x="742" y="226" class="desc">Reusable capabilities</text>
+  <rect x="722" y="146" width="284" height="154" rx="18" fill="#aa5511"/>
+  <text x="742" y="184" class="name">metaclaw-skills</text>
+  <text x="742" y="212" class="desc">Reusable capabilities</text>
+  <text x="742" y="236" class="meta">SKILL.md + capability.contract</text>
+  <text x="742" y="258" class="meta">Versioned reusable modules</text>
 
-  <rect x="1024" y="154" width="284" height="138" rx="18" fill="#6d3ace"/>
-  <text x="1044" y="192" class="name">metaclaw-registry</text>
-  <text x="1044" y="226" class="desc">Publish/distribution API</text>
+  <rect x="1024" y="146" width="284" height="154" rx="18" fill="#6d3ace"/>
+  <text x="1044" y="184" class="name">metaclaw-registry</text>
+  <text x="1044" y="212" class="desc">Publish/distribution API</text>
+  <text x="1044" y="236" class="meta">OCI metadata index + search</text>
+  <text x="1044" y="258" class="meta">Digest and signature verification</text>
 </svg>
