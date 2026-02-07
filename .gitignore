@@ -8,3 +8,7 @@
 # Keep directory structure placeholders
 !**/vault/.gitkeep
 !**/logs/.gitkeep
+
+# Python cache artifacts
+**/__pycache__/
+**/*.pyc
