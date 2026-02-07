@@ -11,6 +11,8 @@ This repo contains only example projects.
 
 ## Ecosystem Repo Map
 
+![Ecosystem Repo Map](docs/diagrams/ecosystem-repo-map.svg)
+
 | Repo | Primary Responsibility | URL |
 | --- | --- | --- |
 | `metaclaw` | Engine core: compiler, runtime adapters, lifecycle/state | https://github.com/fpp-125/metaclaw |
