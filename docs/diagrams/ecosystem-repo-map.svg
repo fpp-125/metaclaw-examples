@@ -12,15 +12,11 @@
     <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
       <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#020617" flood-opacity="0.35"/>
     </filter>
-    <marker id="arrowFlow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#bfdbfe"/>
-    </marker>
     <style>
       .h { font: 700 43px 'Avenir Next', 'Segoe UI', sans-serif; fill: #f8fafc; }
       .name { font: 700 27px 'Avenir Next', 'Segoe UI', sans-serif; fill: #f8fafc; }
       .desc { font: 600 18px 'Avenir Next', 'Segoe UI', sans-serif; fill: #f1f5f9; }
       .meta { font: 500 14px 'Avenir Next', 'Segoe UI', sans-serif; fill: #e2e8f0; }
-      .flow { stroke: #bfdbfe; stroke-width: 2.2; fill: none; marker-end: url(#arrowFlow); opacity: 0.9; }
     </style>
   </defs>
 
@@ -53,9 +49,4 @@
   <text x="1044" y="212" class="desc">Publish/distribution API</text>
   <text x="1044" y="236" class="meta">OCI metadata index + search</text>
   <text x="1044" y="258" class="meta">Digest and signature verification</text>
-
-  <path d="M 402 130 C 412 130, 416 130, 420 130" class="flow"/>
-  <path d="M 704 130 C 714 130, 718 130, 722 130" class="flow"/>
-  <path d="M 1006 130 C 1016 130, 1020 130, 1024 130" class="flow"/>
-  <path d="M 1166 314 C 920 352, 520 352, 260 314" class="flow"/>
 </svg>
