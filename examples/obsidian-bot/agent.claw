@@ -10,12 +10,12 @@ agent:
         network:
             mode: outbound
         mounts:
-            - source: /tmp/metaclaw-examples/examples/obsidian-bot/vault
+            - source: ./examples/obsidian-bot/vault
               target: /vault
-            - source: /tmp/metaclaw-examples/examples/obsidian-bot/config
+            - source: ./examples/obsidian-bot/config
               target: /config
               readOnly: true
-            - source: /tmp/metaclaw-examples/examples/obsidian-bot/logs
+            - source: ./examples/obsidian-bot/logs
               target: /logs
         env:
             METACLAW_CONFIG_DIR: /config
