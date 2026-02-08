@@ -19,23 +19,85 @@ TAGGED_IMAGE="$IMAGE_REPO:$IMAGE_TAG"
   --tag "$TAGGED_IMAGE" \
   "$PROJECT_DIR"
 
-LIST_JSON="$($RUNTIME_BIN image list --format json)"
-REF="$(printf '%s' "$LIST_JSON" | jq -r --arg tag "$TAGGED_IMAGE" '.[] | select(.reference == $tag or (.reference | endswith("/" + $tag)) or (.reference | endswith($tag))) | .reference' | head -n 1)"
-DIGEST="$(printf '%s' "$LIST_JSON" | jq -r --arg tag "$TAGGED_IMAGE" '.[] | select(.reference == $tag or (.reference | endswith("/" + $tag)) or (.reference | endswith($tag))) | .descriptor.digest' | head -n 1)"
+resolve_pinned_image() {
+  local ref=""
+  local digest=""
+  local fallback_ref="${TAGGED_IMAGE%%@*}"
 
-if [ -z "$REF" ] || [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
-  echo "failed to resolve built image reference/digest for $TAGGED_IMAGE" >&2
-  exit 1
-fi
+  case "$RUNTIME_BIN" in
+    podman|docker)
+      ref="$("$RUNTIME_BIN" image inspect "$TAGGED_IMAGE" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)"
+      ref="$(printf '%s' "$ref" | head -n 1 | tr -d '\r')"
+      if [ -n "$ref" ] && [ "$ref" != "<no value>" ] && [ "$ref" != "null" ]; then
+        digest="${ref##*@}"
+      else
+        digest="$("$RUNTIME_BIN" image inspect "$TAGGED_IMAGE" --format '{{.Digest}}' 2>/dev/null || true)"
+        digest="$(printf '%s' "$digest" | head -n 1 | tr -d '\r')"
+        ref=""
+      fi
+      ;;
+    container)
+      if ! command -v jq >/dev/null 2>&1; then
+        echo "jq not found: required to parse container image inspect output" >&2
+        return 1
+      fi
+      local inspect_json
+      inspect_json="$("$RUNTIME_BIN" image inspect "$TAGGED_IMAGE")"
+      digest="$(printf '%s' "$inspect_json" | jq -r '.[0].index.digest // empty' | head -n 1)"
+      ref="$(printf '%s' "$inspect_json" | jq -r '.[0].name // empty' | head -n 1)"
+      ;;
+    *)
+      if ! command -v jq >/dev/null 2>&1; then
+        echo "jq not found: required to parse image list output for runtime $RUNTIME_BIN" >&2
+        return 1
+      fi
+      local list_json
+      list_json="$("$RUNTIME_BIN" image list --format json)"
+      ref="$(printf '%s' "$list_json" | jq -r --arg tag "$TAGGED_IMAGE" '
+        .[]?
+        | . as $img
+        | (if (($img.reference // null) | type) == "string" then $img.reference else "" end) as $r
+        | select($r != "" and ($r == $tag or ($r | endswith("/" + $tag)) or ($r | endswith($tag))))
+        | $r
+      ' | head -n 1)"
+      digest="$(printf '%s' "$list_json" | jq -r --arg ref "$ref" '
+        .[]?
+        | select((.reference // "") == $ref)
+        | (.descriptor.digest // .Digest // empty)
+      ' | head -n 1)"
+      ;;
+  esac
 
-PINNED_REF="${REF%%@*}@$DIGEST"
+  if [ -z "$digest" ] || [ "$digest" = "null" ] || [ "$digest" = "<no value>" ]; then
+    echo "failed to resolve digest for built image $TAGGED_IMAGE using runtime $RUNTIME_BIN" >&2
+    return 1
+  fi
+
+  if [ -z "$ref" ] || [ "$ref" = "null" ] || [ "$ref" = "<no value>" ]; then
+    ref="$fallback_ref"
+  fi
+  ref="${ref%%@*}"
+
+  RESOLVED_REFERENCE="$ref"
+  RESOLVED_DIGEST="$digest"
+  PINNED_REF="${RESOLVED_REFERENCE}@${RESOLVED_DIGEST}"
+}
+
+RESOLVED_REFERENCE=""
+RESOLVED_DIGEST=""
+PINNED_REF=""
+resolve_pinned_image
 
 # Ensure the local store has an explicit digest reference to avoid remote pull attempts.
-"$RUNTIME_BIN" image tag "$TAGGED_IMAGE" "$PINNED_REF" >/dev/null
+if [ "$RUNTIME_BIN" != "docker" ]; then
+  if ! "$RUNTIME_BIN" image tag "$TAGGED_IMAGE" "$PINNED_REF" >/dev/null 2>&1; then
+    echo "warning: unable to tag digest reference in local runtime store: $PINNED_REF" >&2
+  fi
+fi
 
 echo "built_image_tag: $TAGGED_IMAGE"
-echo "resolved_reference: $REF"
-echo "resolved_digest: $DIGEST"
+echo "resolved_reference: $RESOLVED_REFERENCE"
+echo "resolved_digest: $RESOLVED_DIGEST"
 echo "pinned_runtime_image: $PINNED_REF"
 
 if [ "$WRITE_CLAW" = "1" ]; then
