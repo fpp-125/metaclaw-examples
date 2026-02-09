@@ -100,6 +100,8 @@ METACLAW_BIN=/abs/path/to/metaclaw ./chat.sh
 - `/status`
 - `/history`
 - `/render` or `/render plain|glow|demo`
+- `/focus` or `/focus start|end|stay|input [--default]`
+- `/show` or `/show start|end`
 - `/net` or `/net none|out [--default]`
 - `/vault` or `/vault ro|rw [--default]`
 - `/scope` or `/scope limited|all [--default]`
@@ -119,6 +121,13 @@ Command menu keys:
 - `h/l` move focus
 - `space` or `Enter` select
 - `q`/`ESC` cancel
+
+Output focus modes:
+
+- `start`: page the response from the top (best for long answers)
+- `end`: page the response from the bottom
+- `stay`: print inline (normal scrollback)
+- `input`: keep you at the prompt, store the response for `/show`
 
 ## In-Container Tools (Autonomous)
 

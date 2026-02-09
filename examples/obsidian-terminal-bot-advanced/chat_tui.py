@@ -44,6 +44,7 @@ RUN_LOG_FILE = Path("/tmp/metaclaw_chat_run.log")
 EFFECTIVE_AGENT_FILE = RUNTIME_DIR / "agent.effective.claw"
 DEFAULTS_FILE = HOST_CONFIG_DIR / "ui.defaults.json"
 WRITE_AUDIT_FILE = HOST_LOG_DIR / "write_audit.jsonl"
+LAST_RESPONSE_MD_FILE = RUNTIME_DIR / "last_response.md"
 
 DEFAULT_METACLAW_BIN = "metaclaw"
 FALLBACK_METACLAW_BINS = (
@@ -61,6 +62,12 @@ DEFAULT_VALUES = {
     "retrieval_scope": "limited",
     "write_confirm_mode": "enter_once",
     "save_default_dir": "Research/Market-Reports",
+    # Where you "land" after a response:
+    # - stay: print inline (normal scrollback)
+    # - start: open a pager at the top
+    # - end: open a pager at the bottom
+    # - input: keep you at the prompt; store response for `/show`
+    "output_focus": "start",
 }
 
 NETWORK_CHOICES = [
@@ -84,6 +91,12 @@ CONFIRM_CHOICES = [
     ("diff_yes", "diff"),
     ("allowlist_auto", "auto"),
 ]
+FOCUS_CHOICES = [
+    ("start", "start"),
+    ("end", "end"),
+    ("stay", "stay"),
+    ("input", "input"),
+]
 
 
 @dataclass
@@ -94,6 +107,7 @@ class SessionState:
     retrieval_scope: str
     write_confirm_mode: str
     save_default_dir: str
+    output_focus: str
 
 
 def supports_color() -> bool:
@@ -252,6 +266,13 @@ def normalize_confirm_mode(mode: str) -> str:
     return mode
 
 
+def normalize_focus(value: str) -> str:
+    v = (value or "").strip().lower()
+    if v not in {"start", "end", "stay", "input"}:
+        return DEFAULT_VALUES["output_focus"]
+    return v
+
+
 def sanitize_default_dir(value: str) -> str:
     cleaned = sanitize_vault_relative_path(value, require_md=False)
     first = cleaned.parts[0] if cleaned.parts else ""
@@ -292,6 +313,8 @@ def load_defaults() -> dict[str, str]:
             out["write_confirm_mode"] = normalize_confirm_mode(payload["write_confirm_mode"])
         if isinstance(payload.get("save_default_dir"), str):
             out["save_default_dir"] = sanitize_default_dir(payload["save_default_dir"])
+        if isinstance(payload.get("output_focus"), str):
+            out["output_focus"] = normalize_focus(payload["output_focus"])
     except Exception:
         return dict(DEFAULT_VALUES)
     return out
@@ -305,6 +328,7 @@ def save_defaults(values: dict[str, str]) -> None:
         "retrieval_scope": normalize_scope(values.get("retrieval_scope", DEFAULT_VALUES["retrieval_scope"])),
         "write_confirm_mode": normalize_confirm_mode(values.get("write_confirm_mode", DEFAULT_VALUES["write_confirm_mode"])),
         "save_default_dir": sanitize_default_dir(values.get("save_default_dir", DEFAULT_VALUES["save_default_dir"])),
+        "output_focus": normalize_focus(values.get("output_focus", DEFAULT_VALUES["output_focus"])),
     }
     DEFAULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     DEFAULTS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -343,6 +367,14 @@ def confirm_mode_label(mode: str) -> str:
     return labels.get(mode, mode)
 
 
+def focus_label(mode: str) -> str:
+    return normalize_focus(mode)
+
+
+def has_less() -> bool:
+    return shutil.which("less") is not None
+
+
 def key_is_ready() -> bool:
     return bool(os.getenv(get_key_env_name()))
 
@@ -361,12 +393,13 @@ def print_banner(metaclaw_bin: str, state: SessionState) -> None:
         f"{c('Scope:', '1;33')}   {state.retrieval_scope}",
         f"{c('Confirm:', '1;33')} {confirm_mode_label(state.write_confirm_mode)}",
         f"{c('Render:', '1;33')}  {state.render_mode}" + (" (glow ready)" if has_glow() else ""),
+        f"{c('Focus:', '1;33')}   {focus_label(state.output_focus)}",
         f"{c('LLM key:', '1;33')} {get_key_env_name()} {'(set)' if key_is_ready() else '(missing)'}",
         f"{c('Web key:', '1;33')} {get_web_key_env_name()} {'(set)' if web_key_is_ready() else '(missing)'}",
         f"{c('Host data:', '1;33')} {HOST_DATA_DIR}",
         f"{c('MetaClaw:', '1;33')} {metaclaw_bin}",
         "",
-        f"{c('Commands:', '1;32')} /help /status /model /history /render /net /vault /scope /confirm /save /append /touch /reset /clear /exit",
+        f"{c('Commands:', '1;32')} /help /status /model /history /render /focus /show /net /vault /scope /confirm /save /append /touch /reset /clear /exit",
     ]
     boxed("MetaClaw Obsidian Terminal Bot", rows)
 
@@ -380,6 +413,8 @@ def print_help() -> None:
         f"{c('/model', '1;32')}      Ask agent to report configured model",
         f"{c('/history', '1;32')}    Show recent local conversation turns",
         f"{c('/render', '1;32')}     Show or set render mode (/render plain|glow|demo [--default])",
+        f"{c('/focus', '1;32')}      Where you land after a response (/focus start|end|stay|input [--default])",
+        f"{c('/show', '1;32')}       View last stored response (/show [start|end])",
         f"{c('/net', '1;32')}        Show or set network mode (/net none|out [--default])",
         f"{c('/vault', '1;32')}      Show or set vault access (/vault ro|rw [--default])",
         f"{c('/scope', '1;32')}      Show or set retrieval scope (/scope limited|all [--default])",
@@ -431,6 +466,128 @@ def render_plain_response(text: str) -> None:
             continue
         for line in wrapped:
             print(f"  {line}")
+
+
+def render_glow_to_ansi(text: str) -> str | None:
+    glow_bin = shutil.which("glow")
+    if glow_bin is None:
+        return None
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as tmpf:
+            tmpf.write(text + "\n")
+            tmp_path = Path(tmpf.name)
+
+        cmd = [glow_bin, "-s", os.getenv("GLOW_STYLE", "dark"), "-w", str(max(40, width() - 4)), str(tmp_path)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return None
+        return proc.stdout
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def wrap_plain_to_text(text: str) -> str:
+    w = width() - 4
+    out_lines: list[str] = []
+    for raw_line in text.splitlines() or [""]:
+        if raw_line.strip() == "":
+            out_lines.append("")
+            continue
+        wrapped = textwrap.wrap(
+            raw_line,
+            width=w,
+            replace_whitespace=False,
+            drop_whitespace=False,
+        )
+        if not wrapped:
+            out_lines.append("")
+            continue
+        for line in wrapped:
+            out_lines.append(f"  {line}")
+    return "\n".join(out_lines) + "\n"
+
+
+def page_text(text: str, *, start_at_end: bool) -> bool:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    less_bin = shutil.which("less")
+    if less_bin is None:
+        return False
+
+    cmd = [less_bin, "-R", "-F"]
+    if start_at_end:
+        cmd.append("+G")
+    try:
+        proc = subprocess.run(cmd, input=text, text=True)
+        return proc.returncode in {0, 1}
+    except Exception:
+        return False
+
+
+def present_bot_response(text: str, elapsed: float, state: SessionState) -> str:
+    """Render a bot response using the selected focus behavior.
+
+    Returns the render mode actually used: plain|glow.
+    """
+    header = f"{c('bot>', '1;34')} {c(f'({elapsed:.1f}s)', '2')}\n\n"
+
+    focus = normalize_focus(state.output_focus)
+    mode = normalize_render_mode(state.render_mode)
+
+    if focus == "input":
+        LAST_RESPONSE_MD_FILE.write_text(text + "\n", encoding="utf-8")
+        print(header.rstrip("\n"))
+        print(c("meta> response stored (use /show to view)", "2"))
+        print("")
+        return mode
+
+    want_pager = focus in {"start", "end"} and has_less()
+
+    ansi: str | None = None
+    used_mode = "plain"
+    if mode == "glow" and looks_like_markdown(text):
+        ansi = render_glow_to_ansi(text)
+        if ansi is not None:
+            used_mode = "glow"
+    if ansi is None:
+        ansi = wrap_plain_to_text(text)
+        used_mode = "plain"
+
+    if want_pager:
+        if page_text(header + ansi, start_at_end=(focus == "end")):
+            return used_mode
+
+    # Inline fallback (or focus=stay).
+    print(header, end="")
+    sys.stdout.flush()
+    if used_mode == "glow" and mode == "glow" and looks_like_markdown(text) and render_glow_response(text):
+        return "glow"
+    render_plain_response(text)
+    return "plain"
+
+
+def show_last_response(state: SessionState, *, start_at_end: bool) -> None:
+    if not LAST_RESPONSE_MD_FILE.exists():
+        print(c("meta> no stored response yet", "2"))
+        return
+    text = LAST_RESPONSE_MD_FILE.read_text(encoding="utf-8", errors="ignore").rstrip("\n")
+    mode = normalize_render_mode(state.render_mode)
+    ansi: str | None = None
+    if mode == "glow" and looks_like_markdown(text):
+        ansi = render_glow_to_ansi(text)
+    if ansi is None:
+        ansi = wrap_plain_to_text(text)
+    header = c("bot>", "1;34") + " " + c("(stored)", "2") + "\n\n"
+    if page_text(header + ansi, start_at_end=start_at_end):
+        return
+    print(header, end="")
+    sys.stdout.flush()
+    if mode == "glow" and looks_like_markdown(text) and render_glow_response(text):
+        return
+    render_plain_response(text)
 
 
 def render_glow_response(text: str) -> bool:
@@ -578,6 +735,7 @@ def local_status(state: SessionState) -> None:
         f"{c('Scope mode:', '1;33')} {state.retrieval_scope}",
         f"{c('Confirm mode:', '1;33')} {confirm_mode_label(state.write_confirm_mode)}",
         f"{c('Render mode:', '1;33')} {state.render_mode}" + (" (glow ready)" if has_glow() else " (glow missing)"),
+        f"{c('Focus mode:', '1;33')} {focus_label(state.output_focus)}",
         f"{c('Save default dir:', '1;33')} {state.save_default_dir}",
         f"{c('LLM key env:', '1;33')} {get_key_env_name()} {'(set)' if key_is_ready() else '(missing)'}",
         f"{c('Web key env:', '1;33')} {get_web_key_env_name()} {'(set)' if web_key_is_ready() else '(missing)'}",
@@ -776,6 +934,9 @@ def apply_mode_change(
     elif key == "write_confirm_mode":
         state.write_confirm_mode = normalize_confirm_mode(value)
         display = confirm_mode_label(state.write_confirm_mode)
+    elif key == "output_focus":
+        state.output_focus = normalize_focus(value)
+        display = focus_label(state.output_focus)
     else:
         raise ValueError(f"unsupported mode key: {key}")
 
@@ -787,6 +948,7 @@ def apply_mode_change(
         defaults["vault_access"] = normalize_vault_access(defaults.get("vault_access", DEFAULT_VALUES["vault_access"]))
         defaults["retrieval_scope"] = normalize_scope(defaults["retrieval_scope"])
         defaults["write_confirm_mode"] = normalize_confirm_mode(defaults["write_confirm_mode"])
+        defaults["output_focus"] = normalize_focus(defaults.get("output_focus", DEFAULT_VALUES["output_focus"]))
         save_defaults(defaults)
         print(c("meta> saved as project default", "2"))
 
@@ -1226,12 +1388,14 @@ def main() -> int:
         retrieval_scope=normalize_scope(defaults["retrieval_scope"]),
         write_confirm_mode=normalize_confirm_mode(defaults["write_confirm_mode"]),
         save_default_dir=sanitize_default_dir(defaults["save_default_dir"]),
+        output_focus=normalize_focus(defaults.get("output_focus", DEFAULT_VALUES["output_focus"])),
     )
 
     # Environment overrides are session-only.
     state.network_mode = normalize_network_mode(os.getenv("BOT_NETWORK_MODE", state.network_mode))
     state.render_mode = normalize_render_mode(os.getenv("BOT_RENDER_MODE", state.render_mode))
     state.vault_access = normalize_vault_access(os.getenv("BOT_VAULT_ACCESS", state.vault_access))
+    state.output_focus = normalize_focus(os.getenv("BOT_OUTPUT_FOCUS", state.output_focus))
 
     print_banner(metaclaw_bin, state)
 
@@ -1297,6 +1461,32 @@ def main() -> int:
                     print(c("meta> glow is not installed, staying in plain mode", "33"))
                     selected = "plain"
                 apply_mode_change(state, defaults, "render_mode", selected, persist)
+                continue
+
+            if cmd == "/focus":
+                value, persist = parse_value_and_default(args)
+                selected = None
+                if value is None:
+                    selected = prompt_select("focus", FOCUS_CHOICES, state.output_focus)
+                else:
+                    selected = value.lower()
+                if selected is None:
+                    continue
+                selected = normalize_focus(selected)
+                if selected not in {"start", "end", "stay", "input"}:
+                    print(c("meta> usage: /focus start|end|stay|input [--default]", "31"))
+                    continue
+                apply_mode_change(state, defaults, "output_focus", selected, persist)
+                continue
+
+            if cmd == "/show":
+                where = "start"
+                if args:
+                    where = args[0].strip().lower()
+                if where not in {"start", "end"}:
+                    print(c("meta> usage: /show [start|end]", "31"))
+                    continue
+                show_last_response(state, start_at_end=(where == "end"))
                 continue
 
             if cmd in {"/net", "/network"}:
@@ -1393,7 +1583,7 @@ def main() -> int:
             continue
 
         response_text = read_response_text()
-        used_mode = pretty_print_bot_response(response_text, elapsed, state.render_mode)
+        used_mode = present_bot_response(response_text, elapsed, state)
         if state.render_mode == "glow" and looks_like_markdown(response_text) and used_mode != state.render_mode:
             print(c(f"\nmeta> glow render failed, used {used_mode}", "33"))
 
