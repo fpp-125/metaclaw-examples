@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import time
+import random
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -35,6 +36,10 @@ TOOL_MAX_OUTPUT_BYTES = int(os.getenv("BOT_TOOL_MAX_OUTPUT_BYTES", "32768").stri
 TOOL_MAX_READ_BYTES = int(os.getenv("BOT_TOOL_MAX_READ_BYTES", "262144").strip() or "262144")
 TOOL_MAX_WRITE_BYTES = int(os.getenv("BOT_TOOL_MAX_WRITE_BYTES", "524288").strip() or "524288")
 TOOL_MAX_SEARCH_FILES = int(os.getenv("BOT_TOOL_MAX_SEARCH_FILES", "800").strip() or "800")
+
+LLM_MAX_RETRIES = int(os.getenv("BOT_LLM_MAX_RETRIES", "4").strip() or "4")
+LLM_RETRY_BASE_SEC = float(os.getenv("BOT_LLM_RETRY_BASE_SEC", "0.8").strip() or "0.8")
+LLM_RETRY_MAX_SEC = float(os.getenv("BOT_LLM_RETRY_MAX_SEC", "6.0").strip() or "6.0")
 
 DEFAULT_ALLOW_CMDS = "ls,find,grep"
 TOOL_ALLOW_CMDS = {
@@ -792,14 +797,63 @@ def call_openai_compatible(messages: list) -> str:
         },
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            raw = resp.read().decode("utf-8", errors="ignore")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"llm http {e.code}: {body[:500]}") from e
-    except Exception as e:
-        raise RuntimeError(f"llm request failed: {e}") from e
+    def retry_sleep(attempt: int) -> None:
+        base = max(0.05, LLM_RETRY_BASE_SEC) * (2 ** max(0, attempt))
+        delay = min(max(0.05, base + random.uniform(0, base * 0.25)), max(0.2, LLM_RETRY_MAX_SEC))
+        time.sleep(delay)
+
+    def is_transient_http(code: int) -> bool:
+        return code in {408, 425, 429, 500, 502, 503, 504}
+
+    last_err: Exception | None = None
+    for attempt in range(max(0, LLM_MAX_RETRIES) + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            last_err = None
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            if attempt < LLM_MAX_RETRIES and is_transient_http(int(getattr(e, "code", 0) or 0)):
+                audit_tool(
+                    {
+                        "tool": "llm.retry",
+                        "id": None,
+                        "ok": False,
+                        "elapsed_sec": 0.0,
+                        "detail": f"http {e.code} transient",
+                    }
+                )
+                retry_sleep(attempt)
+                last_err = e
+                continue
+            raise RuntimeError(f"llm http {e.code}: {body[:500]}") from e
+        except Exception as e:
+            # Common transient error from some providers: connection closed before a response is returned.
+            msg = str(e).lower()
+            transient = (
+                "remote end closed connection" in msg
+                or "timed out" in msg
+                or "temporarily unavailable" in msg
+                or "connection reset" in msg
+                or "connection aborted" in msg
+            )
+            if attempt < LLM_MAX_RETRIES and transient:
+                audit_tool(
+                    {
+                        "tool": "llm.retry",
+                        "id": None,
+                        "ok": False,
+                        "elapsed_sec": 0.0,
+                        "detail": f"transient error: {msg[:120]}",
+                    }
+                )
+                retry_sleep(attempt)
+                last_err = e
+                continue
+            raise RuntimeError(f"llm request failed: {e}") from e
+    else:  # pragma: no cover
+        raise RuntimeError(f"llm request failed after retries: {last_err}") from last_err
 
     try:
         obj = json.loads(raw)
