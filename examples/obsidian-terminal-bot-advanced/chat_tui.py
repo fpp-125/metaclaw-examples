@@ -148,17 +148,37 @@ def save_readline_history() -> None:
 
 
 def resolve_metaclaw_bin() -> str:
-    metaclaw_bin = os.getenv("METACLAW_BIN", DEFAULT_METACLAW_BIN).strip()
+    def is_executable_file(path: Path) -> bool:
+        return path.is_file() and os.access(str(path), os.X_OK)
+
+    def find_executable(path: Path) -> Path | None:
+        # Accept either a direct binary path or a repo directory containing ./bin/metaclaw.
+        if is_executable_file(path):
+            return path
+        if path.is_dir():
+            for sub in (
+                path / "bin" / "metaclaw",
+                path / "metaclaw",
+            ):
+                if is_executable_file(sub):
+                    return sub
+        return None
+
+    metaclaw_bin = os.getenv("METACLAW_BIN", DEFAULT_METACLAW_BIN).strip().strip("'\"")
     resolved = shutil.which(metaclaw_bin) if metaclaw_bin else None
     if resolved:
         return resolved
-    if metaclaw_bin and Path(metaclaw_bin).exists() and os.access(metaclaw_bin, os.X_OK):
-        return metaclaw_bin
+    if metaclaw_bin:
+        found = find_executable(Path(metaclaw_bin))
+        if found:
+            return str(found)
     for candidate in FALLBACK_METACLAW_BINS:
-        if candidate.exists() and os.access(candidate, os.X_OK):
-            return str(candidate)
+        found = find_executable(candidate)
+        if found:
+            return str(found)
     print("metaclaw binary not found.", file=sys.stderr)
-    print("Set METACLAW_BIN=/absolute/path/to/metaclaw", file=sys.stderr)
+    print("Build it (from the metaclaw repo): go build -o ./bin/metaclaw ./cmd/metaclaw", file=sys.stderr)
+    print("Then set METACLAW_BIN=/absolute/path/to/bin/metaclaw", file=sys.stderr)
     sys.exit(1)
 
 
