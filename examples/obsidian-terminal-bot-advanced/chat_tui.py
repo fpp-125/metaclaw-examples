@@ -539,10 +539,20 @@ def present_bot_response(text: str, elapsed: float, state: SessionState) -> str:
 
     if focus == "input":
         LAST_RESPONSE_MD_FILE.write_text(text + "\n", encoding="utf-8")
-        print(header.rstrip("\n"))
-        print(c("meta> response stored (use /show to view)", "2"))
+        # Still print the full response, but also keep a stored copy for `/show`.
+        # This keeps the user flow "at the prompt" while preserving scrollback.
+        print(header, end="")
+        sys.stdout.flush()
+        used_mode = "plain"
+        if mode == "glow" and looks_like_markdown(text) and render_glow_response(text):
+            used_mode = "glow"
+        else:
+            render_plain_response(text)
+            used_mode = "plain"
         print("")
-        return mode
+        print(c("meta> response stored (use /show start|end)", "2"))
+        print("")
+        return used_mode
 
     want_pager = focus in {"start", "end"} and has_less()
 
