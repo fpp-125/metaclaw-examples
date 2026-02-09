@@ -525,7 +525,20 @@ def run_tool_loop(user_prompt: str, history: list[dict], vault_context: str, web
         last_raw = raw
         obj = extract_first_json_object(raw)
         if not obj or "type" not in obj:
-            # Provider/model didn't follow the JSON-only contract; treat as final markdown.
+            # Provider/model didn't follow the JSON-only contract.
+            # Give it one chance to reformat; then fall back to treating as final markdown.
+            if step == 0:
+                messages.append({"role": "assistant", "content": raw})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your last message was not valid JSON.\n\n"
+                            "Reply again using STRICT JSON ONLY (one JSON object), following the contract."
+                        ),
+                    }
+                )
+                continue
             return raw.strip()
 
         msg_type = str(obj.get("type", "")).strip()
