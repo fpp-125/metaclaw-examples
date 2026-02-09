@@ -5,6 +5,7 @@ A full-featured MetaClaw example with:
 - business logic baked into the image layer (`bot/chat_once.py` + `image/Dockerfile`)
 - `agent.claw` kept as runtime policy/config/entrypoint only
 - host-side TUI (`chat_tui.py`) for safer write flow and better UX
+- in-container tools for autonomous file ops (list/read/search/write + allowlisted CLI) inside the isolated habitat
 
 ## What You Configure
 
@@ -118,6 +119,16 @@ Command menu keys:
 - `h/l` move focus
 - `space` or `Enter` select
 - `q`/`ESC` cancel
+
+## In-Container Tools (Autonomous)
+
+The bot process runs inside the container and can (when policy allows):
+
+- list/read/search files under `/vault` and `/workspace`
+- write/append/touch files under `/vault` and `/workspace` (requires vault mount `rw` for vault writes)
+- run a small allowlisted set of commands via `cmd.exec` (default: `ls`, `find`, `grep`)
+
+Tool calls are best-effort audited to `logs/tool_audit.jsonl` (tool name + status + timing). API keys are never written to files.
 
 ## Security Notes
 

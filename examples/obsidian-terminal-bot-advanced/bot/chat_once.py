@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+import datetime as dt
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -18,12 +21,549 @@ SESSION_FILE = RUNTIME_DIR / "session.json"
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 TAVILY_API_URL = os.getenv("TAVILY_API_URL", "https://api.tavily.com/search").strip()
 LIMITED_SCOPE_PREFIXES = ("Research/", "Learning/")
+TOOL_AUDIT_FILE = LOG_DIR / "tool_audit.jsonl"
 
 STOPWORDS = {
     "the", "this", "that", "with", "from", "have", "what", "when", "where", "which", "about",
     "into", "your", "you", "and", "for", "are", "how", "can", "use", "using", "should", "please",
     "在", "这个", "那个", "怎么", "可以", "一下", "关于", "以及", "需要", "帮我", "一个",
 }
+
+TOOL_MAX_STEPS = int(os.getenv("BOT_TOOL_MAX_STEPS", "6").strip() or "6")
+TOOL_TIMEOUT_SEC = float(os.getenv("BOT_TOOL_TIMEOUT_SEC", "5").strip() or "5")
+TOOL_MAX_OUTPUT_BYTES = int(os.getenv("BOT_TOOL_MAX_OUTPUT_BYTES", "32768").strip() or "32768")
+TOOL_MAX_READ_BYTES = int(os.getenv("BOT_TOOL_MAX_READ_BYTES", "262144").strip() or "262144")
+TOOL_MAX_WRITE_BYTES = int(os.getenv("BOT_TOOL_MAX_WRITE_BYTES", "524288").strip() or "524288")
+TOOL_MAX_SEARCH_FILES = int(os.getenv("BOT_TOOL_MAX_SEARCH_FILES", "800").strip() or "800")
+
+DEFAULT_ALLOW_CMDS = "ls,find,grep"
+TOOL_ALLOW_CMDS = {
+    c.strip()
+    for c in (os.getenv("BOT_TOOL_ALLOW_CMDS", DEFAULT_ALLOW_CMDS) or DEFAULT_ALLOW_CMDS).split(",")
+    if c.strip()
+}
+
+DEFAULT_ALLOWED_ROOTS = "/vault,/workspace"
+TOOL_ALLOWED_ROOTS = [
+    Path(p.strip())
+    for p in (os.getenv("BOT_TOOL_ALLOWED_ROOTS", DEFAULT_ALLOWED_ROOTS) or DEFAULT_ALLOWED_ROOTS).split(",")
+    if p.strip()
+]
+
+DEFAULT_WRITE_ROOTS = "/vault,/workspace"
+TOOL_WRITE_ROOTS = [
+    Path(p.strip())
+    for p in (os.getenv("BOT_TOOL_WRITE_ROOTS", DEFAULT_WRITE_ROOTS) or DEFAULT_WRITE_ROOTS).split(",")
+    if p.strip()
+]
+
+
+def audit_tool(event: dict) -> None:
+    payload = {
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    payload.update(event)
+    try:
+        TOOL_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with TOOL_AUDIT_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        # Best-effort: audit should never fail the run.
+        pass
+
+
+def truncate_bytes(text: str, max_bytes: int) -> tuple[str, bool]:
+    b = text.encode("utf-8", errors="ignore")
+    if len(b) <= max_bytes:
+        return text, False
+    cut = b[:max_bytes]
+    # Avoid splitting multi-byte sequences.
+    out = cut.decode("utf-8", errors="ignore")
+    return out + "\n...[truncated]...\n", True
+
+
+def normalize_path_input(raw: str) -> str:
+    raw = (raw or "").strip()
+    if raw.startswith("vault/"):
+        return "/" + raw
+    if raw.startswith("workspace/"):
+        return "/" + raw
+    return raw
+
+
+def resolve_under_allowed_roots(path_str: str, *, for_write: bool) -> Path:
+    value = normalize_path_input(path_str)
+    if value == "":
+        raise ValueError("path is empty")
+
+    # Prefer absolute paths. If relative, interpret relative to /workspace.
+    if value.startswith("/"):
+        candidate = Path(value)
+    else:
+        candidate = (WORKSPACE_DIR / value)
+
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        resolved = candidate.absolute()
+
+    roots = TOOL_WRITE_ROOTS if for_write else TOOL_ALLOWED_ROOTS
+    resolved_roots: list[Path] = []
+    for r in roots:
+        try:
+            resolved_roots.append(r.resolve())
+        except Exception:
+            resolved_roots.append(r.absolute())
+
+    for root in resolved_roots:
+        try:
+            common = os.path.commonpath([str(root), str(resolved)])
+        except ValueError:
+            continue
+        if common == str(root):
+            return resolved
+
+    scope = "write" if for_write else "read"
+    allowed = ", ".join(str(r) for r in roots)
+    raise ValueError(f"path is outside allowed {scope} roots ({allowed})")
+
+
+def tool_fs_list_dir(args: dict) -> dict:
+    path = str(args.get("path", "")).strip()
+    depth = int(args.get("depth", 1) or 1)
+    max_entries = int(args.get("max_entries", 200) or 200)
+    if depth < 1:
+        depth = 1
+    if depth > 4:
+        depth = 4
+    if max_entries < 1:
+        max_entries = 1
+    if max_entries > 1000:
+        max_entries = 1000
+
+    p = resolve_under_allowed_roots(path, for_write=False)
+    if not p.exists():
+        return {"ok": False, "error": "path does not exist"}
+    if not p.is_dir():
+        return {"ok": False, "error": "path is not a directory"}
+
+    results = []
+    base = p
+    try:
+        base_rel = base
+    except Exception:
+        base_rel = base
+
+    # Walk with depth control.
+    queue: list[tuple[Path, int]] = [(p, 0)]
+    while queue and len(results) < max_entries:
+        cur, d = queue.pop(0)
+        try:
+            entries = sorted(cur.iterdir(), key=lambda x: x.name.lower())
+        except Exception:
+            continue
+        for e in entries:
+            if e.name.startswith("."):
+                continue
+            try:
+                rel = e.relative_to(base)
+            except Exception:
+                rel = e
+            item = {
+                "path": str(rel),
+                "type": "dir" if e.is_dir() else "file",
+            }
+            results.append(item)
+            if len(results) >= max_entries:
+                break
+            if e.is_dir() and d + 1 < depth:
+                queue.append((e, d + 1))
+
+    return {"ok": True, "entries": results, "base": str(base_rel)}
+
+
+def tool_fs_read_file(args: dict) -> dict:
+    path = str(args.get("path", "")).strip()
+    max_bytes = int(args.get("max_bytes", TOOL_MAX_READ_BYTES) or TOOL_MAX_READ_BYTES)
+    if max_bytes < 1:
+        max_bytes = TOOL_MAX_READ_BYTES
+    if max_bytes > 1024 * 1024:
+        max_bytes = 1024 * 1024
+    p = resolve_under_allowed_roots(path, for_write=False)
+    if not p.exists() or not p.is_file():
+        return {"ok": False, "error": "file not found"}
+    try:
+        raw = p.read_bytes()
+    except Exception as exc:
+        return {"ok": False, "error": f"read failed: {exc}"}
+    clipped = raw[:max_bytes]
+    text = clipped.decode("utf-8", errors="ignore")
+    truncated = len(raw) > max_bytes
+    if truncated:
+        text += "\n...[truncated]...\n"
+    return {"ok": True, "path": str(p), "text": text, "truncated": truncated, "bytes": len(raw)}
+
+
+def tool_fs_write_file(args: dict) -> dict:
+    path = str(args.get("path", "")).strip()
+    content = args.get("content", "")
+    create_dirs = bool(args.get("create_dirs", True))
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False)
+    clipped, truncated = truncate_bytes(content, TOOL_MAX_WRITE_BYTES)
+    p = resolve_under_allowed_roots(path, for_write=True)
+    try:
+        if create_dirs:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(clipped, encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "error": f"write failed: {exc}"}
+    return {"ok": True, "path": str(p), "bytes": len(clipped.encode('utf-8')), "truncated": truncated}
+
+
+def tool_fs_append_file(args: dict) -> dict:
+    path = str(args.get("path", "")).strip()
+    content = args.get("content", "")
+    create_dirs = bool(args.get("create_dirs", True))
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False)
+    clipped, truncated = truncate_bytes(content, TOOL_MAX_WRITE_BYTES)
+    p = resolve_under_allowed_roots(path, for_write=True)
+    try:
+        if create_dirs:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(clipped)
+    except Exception as exc:
+        return {"ok": False, "error": f"append failed: {exc}"}
+    return {"ok": True, "path": str(p), "bytes": len(clipped.encode('utf-8')), "truncated": truncated}
+
+
+def tool_fs_touch(args: dict) -> dict:
+    path = str(args.get("path", "")).strip()
+    create_dirs = bool(args.get("create_dirs", True))
+    p = resolve_under_allowed_roots(path, for_write=True)
+    try:
+        if create_dirs:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.write_text("", encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "error": f"touch failed: {exc}"}
+    return {"ok": True, "path": str(p)}
+
+
+def tool_fs_search(args: dict) -> dict:
+    root = str(args.get("root", "")).strip() or "/vault"
+    query = str(args.get("query", "")).strip()
+    glob = str(args.get("glob", "*.md")).strip() or "*.md"
+    max_files = int(args.get("max_files", TOOL_MAX_SEARCH_FILES) or TOOL_MAX_SEARCH_FILES)
+    max_matches = int(args.get("max_matches", 80) or 80)
+    if query == "":
+        return {"ok": False, "error": "query is empty"}
+    if max_files < 1:
+        max_files = TOOL_MAX_SEARCH_FILES
+    if max_files > 5000:
+        max_files = 5000
+    if max_matches < 1:
+        max_matches = 1
+    if max_matches > 500:
+        max_matches = 500
+
+    root_path = resolve_under_allowed_roots(root, for_write=False)
+    if not root_path.exists() or not root_path.is_dir():
+        return {"ok": False, "error": "root is not a directory"}
+
+    matches = []
+    scanned = 0
+    q = query.lower()
+    for path in root_path.rglob(glob):
+        if scanned >= max_files:
+            break
+        scanned += 1
+        try:
+            if path.is_dir():
+                continue
+            # Skip very large files.
+            if path.stat().st_size > 2_000_000:
+                continue
+        except Exception:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        lower = text.lower()
+        idx = lower.find(q)
+        if idx < 0:
+            continue
+        start = max(0, idx - 120)
+        end = min(len(text), idx + 240)
+        snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+        try:
+            rel = path.relative_to(root_path).as_posix()
+        except Exception:
+            rel = str(path)
+        matches.append({"file": rel, "snippet": snippet})
+        if len(matches) >= max_matches:
+            break
+
+    return {"ok": True, "root": str(root_path), "query": query, "scanned": scanned, "matches": matches}
+
+
+def tool_cmd_exec(args: dict) -> dict:
+    argv = args.get("argv")
+    cwd = str(args.get("cwd", "")).strip() or str(WORKSPACE_DIR)
+    timeout = float(args.get("timeout_sec", TOOL_TIMEOUT_SEC) or TOOL_TIMEOUT_SEC)
+    if timeout < 0.2:
+        timeout = 0.2
+    if timeout > 30:
+        timeout = 30
+
+    if not isinstance(argv, list) or not argv:
+        return {"ok": False, "error": "argv must be a non-empty list"}
+    argv = [str(x) for x in argv]
+    cmd = argv[0].strip()
+    if cmd not in TOOL_ALLOW_CMDS:
+        return {"ok": False, "error": f"command not allowed: {cmd} (allowed: {', '.join(sorted(TOOL_ALLOW_CMDS))})"}
+
+    cwd_path = resolve_under_allowed_roots(cwd, for_write=False)
+
+    # Basic guardrail: reject absolute path args outside allowed roots.
+    for a in argv[1:]:
+        a = str(a)
+        if a.startswith("/"):
+            try:
+                _ = resolve_under_allowed_roots(a, for_write=False)
+            except Exception:
+                return {"ok": False, "error": f"arg path outside allowed roots: {a}"}
+
+    # Sanitize env for spawned commands to reduce accidental secret leakage via printenv, etc.
+    env = {
+        "PATH": os.getenv("PATH", ""),
+        "LANG": os.getenv("LANG", "C.UTF-8"),
+        "LC_ALL": os.getenv("LC_ALL", "C.UTF-8"),
+        "HOME": os.getenv("HOME", "/"),
+        "PWD": str(cwd_path),
+    }
+
+    start = time.time()
+    try:
+        res = subprocess.run(
+            argv,
+            cwd=str(cwd_path),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            text=False,
+        )
+        out = res.stdout or b""
+        truncated = False
+        if len(out) > TOOL_MAX_OUTPUT_BYTES:
+            out = out[:TOOL_MAX_OUTPUT_BYTES]
+            truncated = True
+        text = out.decode("utf-8", errors="ignore")
+        if truncated:
+            text += "\n...[truncated]...\n"
+        return {
+            "ok": True,
+            "exit_code": res.returncode,
+            "output": text,
+            "truncated": truncated,
+            "elapsed_sec": round(time.time() - start, 3),
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"timeout after {timeout}s"}
+    except Exception as exc:
+        return {"ok": False, "error": f"exec failed: {exc}"}
+
+
+TOOL_IMPL = {
+    "fs.list_dir": tool_fs_list_dir,
+    "fs.read_file": tool_fs_read_file,
+    "fs.write_file": tool_fs_write_file,
+    "fs.append_file": tool_fs_append_file,
+    "fs.touch": tool_fs_touch,
+    "fs.search": tool_fs_search,
+    "cmd.exec": tool_cmd_exec,
+}
+
+
+def extract_first_json_object(text: str) -> dict | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    # 1) Raw JSON
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    # 2) ```json fenced block
+    m = re.search(r"```json\\s*(\\{.*?\\})\\s*```", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    # 3) Best-effort: find the first balanced {...} block.
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                chunk = text[start : i + 1]
+                try:
+                    obj = json.loads(chunk)
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    return None
+    return None
+
+
+def execute_tool_call(call: dict) -> dict:
+    tool = str(call.get("tool", "")).strip()
+    call_id = str(call.get("id", "")).strip() or None
+    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    started = time.time()
+    ok = False
+    result: dict | None = None
+    err: str | None = None
+    try:
+        impl = TOOL_IMPL.get(tool)
+        if impl is None:
+            raise ValueError(f"unknown tool: {tool}")
+        result = impl(args)
+        ok = bool(result.get("ok", False)) if isinstance(result, dict) else True
+    except Exception as exc:
+        err = str(exc)
+        result = {"ok": False, "error": err}
+        ok = False
+    elapsed = round(time.time() - started, 3)
+
+    audit_tool(
+        {
+            "tool": tool,
+            "id": call_id,
+            "ok": ok,
+            "elapsed_sec": elapsed,
+        }
+    )
+
+    out = {"tool": tool, "ok": ok, "result": result, "elapsed_sec": elapsed}
+    if call_id:
+        out["id"] = call_id
+    return out
+
+
+def run_tool_loop(user_prompt: str, history: list[dict], vault_context: str, web_context: str, web_only: bool) -> str:
+    allowed_cmds = ", ".join(sorted(TOOL_ALLOW_CMDS))
+    system_prompt = (
+        "You are a file-capable Obsidian vault assistant running inside MetaClaw.\n"
+        "You can inspect and modify files using TOOLS. Use tools whenever the user asks about files, directories, "
+        "searching notes, or creating/updating notes.\n\n"
+        "TOOLS:\n"
+        "- fs.list_dir(path, depth=1, max_entries=200)\n"
+        "- fs.read_file(path, max_bytes)\n"
+        "- fs.search(root, query, glob='*.md', max_files, max_matches)\n"
+        "- fs.write_file(path, content, create_dirs=true)\n"
+        "- fs.append_file(path, content, create_dirs=true)\n"
+        "- fs.touch(path, create_dirs=true)\n"
+        f"- cmd.exec(argv, cwd='/workspace', timeout_sec)  # allowed commands: {allowed_cmds}\n\n"
+        "IMPORTANT:\n"
+        "- Only use paths under /vault or /workspace.\n"
+        "- Prefer fs.* tools for safety; use cmd.exec only when it is clearly simpler.\n"
+        "- Keep outputs concise; do not dump huge directory trees.\n\n"
+        "RESPONSE FORMAT (STRICT JSON ONLY):\n"
+        "1) To call tools:\n"
+        "{\"type\":\"tool_request\",\"calls\":[{\"id\":\"1\",\"tool\":\"fs.list_dir\",\"args\":{\"path\":\"/vault\",\"depth\":2}}]}\n"
+        "2) To finish:\n"
+        "{\"type\":\"final\",\"markdown\":\"...clean markdown...\"}\n"
+    )
+
+    valid_history = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in {"system", "user", "assistant"}:
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        valid_history.append({"role": role, "content": content})
+
+    user_payload = user_prompt
+    if vault_context:
+        user_payload += "\n\n# Retrieved Vault Context\n" + vault_context
+    if web_context:
+        user_payload += "\n\n# Retrieved Web Context (Tavily)\n" + web_context
+    if web_only:
+        user_payload += "\n\n# Mode\nWeb lookup mode requested by user; prioritize web context."
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(valid_history[-12:])
+    messages.append({"role": "user", "content": user_payload})
+
+    last_raw = ""
+    for step in range(max(1, TOOL_MAX_STEPS)):
+        raw = call_openai_compatible(messages)
+        last_raw = raw
+        obj = extract_first_json_object(raw)
+        if not obj or "type" not in obj:
+            # Provider/model didn't follow the JSON-only contract; treat as final markdown.
+            return raw.strip()
+
+        msg_type = str(obj.get("type", "")).strip()
+        if msg_type == "final":
+            return str(obj.get("markdown", "")).strip()
+        if msg_type != "tool_request":
+            # Unknown envelope; treat as final.
+            return raw.strip()
+
+        calls = obj.get("calls")
+        if not isinstance(calls, list) or not calls:
+            # Nothing to do; ask model to finish.
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": "No tool calls provided. Return a final answer as JSON."})
+            continue
+
+        # Execute tool calls (cap per step).
+        results = []
+        for call in calls[:6]:
+            if not isinstance(call, dict):
+                continue
+            results.append(execute_tool_call(call))
+
+        # Feed results back.
+        messages.append({"role": "assistant", "content": raw})
+        tool_result_text = json.dumps(
+            {"type": "tool_result", "results": results},
+            ensure_ascii=False,
+            indent=2,
+        )
+        messages.append({"role": "user", "content": tool_result_text})
+
+    # Step limit hit.
+    return (
+        "I hit the maximum tool-steps limit while trying to complete your request.\n\n"
+        "Here is the last model output I saw:\n\n"
+        + last_raw[:800]
+    )
 
 
 def ensure_dirs() -> None:
@@ -296,42 +836,8 @@ def main() -> int:
     context = retrieve_context(prompt)
     web_context = retrieve_web_context(web_query)
 
-    system_prompt = (
-        "You are an Obsidian vault assistant running inside MetaClaw. "
-        "Use vault context when relevant. Be concise, accurate, and practical. "
-        "If web context is available, use it and include source URLs. "
-        "If context is missing, say what to search next. "
-        "Always answer in clean Markdown (headings, bullet lists, and source links)."
-    )
-    if web_only:
-        system_prompt += " The user explicitly requested web lookup mode; prioritize web context."
-
-    user_payload = prompt
-    if context:
-        user_payload += "\n\n# Retrieved Vault Context\n" + context
-    if web_context:
-        user_payload += "\n\n# Retrieved Web Context (Tavily)\n" + web_context
-
-    # OpenAI-compatible chat endpoints only accept standard chat roles.
-    valid_history = []
-    for item in history:
-        if not isinstance(item, dict):
-            continue
-        role = item.get("role")
-        content = item.get("content")
-        if role not in {"system", "user", "assistant"}:
-            continue
-        if not isinstance(content, str) or not content.strip():
-            continue
-        valid_history.append({"role": role, "content": content})
-
-    history = valid_history
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history[-12:])
-    messages.append({"role": "user", "content": user_payload})
-
     try:
-        answer = call_openai_compatible(messages)
+        answer = run_tool_loop(prompt, history, context, web_context, web_only)
     except Exception as e:
         write_response(f"[bot error] {e}")
         return 1
