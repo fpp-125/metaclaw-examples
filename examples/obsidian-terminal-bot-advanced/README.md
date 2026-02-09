@@ -76,7 +76,7 @@ RUNTIME_BIN=container ./build_image.sh
 # RUNTIME_BIN=podman ./build_image.sh
 
 # 5) Set API keys and run
-export GEMINI_API_KEY='...'
+export OPENAI_FORMAT_API_KEY='...'
 export TAVILY_API_KEY='...'   # optional
 
 METACLAW_BIN="/ABS/PATH/TO/metaclaw/metaclaw" \
@@ -90,7 +90,7 @@ If `metaclaw` is already in your `PATH`, you can omit `METACLAW_BIN=...`.
 ## Run Chat
 
 ```bash
-export GEMINI_API_KEY='...'
+export OPENAI_FORMAT_API_KEY='...'
 export TAVILY_API_KEY='...'
 ./chat.sh
 ```

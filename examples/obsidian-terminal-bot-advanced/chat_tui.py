@@ -111,7 +111,9 @@ LLM_PROVIDER_CATALOG: dict[str, dict] = {
         "label": "Gemini (OpenAI-compatible)",
         "engineProvider": "gemini_openai",
         "baseURL": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "keyEnv": "GEMINI_API_KEY",
+        # Host-side env var holding the API key value. This is intentionally
+        # provider-agnostic so quickstarts can use a single env name.
+        "keyEnv": "OPENAI_FORMAT_API_KEY",
         "models": [
             "gemini-3-flash-preview",
             # Keep the list short and allow custom additions in `/llm setup`.
@@ -122,7 +124,8 @@ LLM_PROVIDER_CATALOG: dict[str, dict] = {
         "label": "OpenAI",
         "engineProvider": "openai_compatible",
         "baseURL": "https://api.openai.com/v1",
-        "keyEnv": "OPENAI_API_KEY",
+        # Same host env name as other OpenAI-compatible providers by default.
+        "keyEnv": "OPENAI_FORMAT_API_KEY",
         "models": [
             "gpt-4o-mini",
             "gpt-4o",
@@ -559,15 +562,18 @@ def get_key_env_name() -> str:
     # - If no llm.config.json exists yet, fall back to the legacy single-env name (LLM_KEY_ENV).
     # - If llm.config.json exists, prefer the configured default provider key env.
     if not LLM_CONFIG_FILE.exists():
-        return os.getenv("LLM_KEY_ENV", "GEMINI_API_KEY")
+        return os.getenv("LLM_KEY_ENV", "OPENAI_FORMAT_API_KEY")
     cfg = load_llm_config()
     default_pid = str((cfg.get("default") or {}).get("providerId", "")).strip()
     for p in cfg.get("providers", []) if isinstance(cfg.get("providers"), list) else []:
         if isinstance(p, dict) and str(p.get("id", "")).strip() == default_pid:
             key_env = str(p.get("keyEnv", "")).strip()
-            if key_env:
+            if key_env and os.getenv(key_env):
                 return key_env
-    return os.getenv("LLM_KEY_ENV", "GEMINI_API_KEY")
+    # If the configured env name isn't set, prefer the session's generic key env
+    # (set by chat.sh / quickstart) so provider switching "just works".
+    fallback = os.getenv("LLM_KEY_ENV", "").strip() or "OPENAI_FORMAT_API_KEY"
+    return fallback
 
 
 def get_web_key_env_name() -> str:
@@ -608,7 +614,10 @@ def has_less() -> bool:
 
 
 def key_is_ready() -> bool:
-    return bool(os.getenv(get_key_env_name()))
+    attempts = llm_attempts_all()
+    if not attempts:
+        return False
+    return pick_first_set_env_key(attempts[0]) is not None
 
 
 def web_key_is_ready() -> bool:
@@ -686,7 +695,29 @@ def llm_attempts_all() -> list[dict]:
 
 
 def llm_attempts_ready() -> list[dict]:
-    return [a for a in llm_attempts_all() if str(a.get("keyEnv", "")).strip() and os.getenv(str(a.get("keyEnv", "")).strip())]
+    return [a for a in llm_attempts_all() if pick_first_set_env_key(a) is not None]
+
+
+def key_env_candidates(preferred: str | None) -> list[str]:
+    # Try the provider-specific env name first, but allow quickstarts to use one
+    # provider-agnostic env name for all OpenAI-compatible endpoints.
+    out: list[str] = []
+    preferred = (preferred or "").strip()
+    if preferred:
+        out.append(preferred)
+    generic = os.getenv("LLM_KEY_ENV", "").strip()
+    if generic and generic not in out:
+        out.append(generic)
+    if "OPENAI_FORMAT_API_KEY" not in out:
+        out.append("OPENAI_FORMAT_API_KEY")
+    return out
+
+
+def pick_first_set_env_key(attempt: dict) -> str | None:
+    for name in key_env_candidates(str(attempt.get("keyEnv", "")).strip()):
+        if name and os.getenv(name):
+            return name
+    return None
 
 
 def llm_default_display() -> str:
@@ -758,7 +789,7 @@ def print_help() -> None:
         "/scope limited --default",
         "/confirm once --default",
         "Key env override example:",
-        "LLM_KEY_ENV=OPENAI_API_KEY ./chat.sh",
+        "LLM_KEY_ENV=OPENAI_FORMAT_API_KEY ./chat.sh",
         "TAVILY_KEY_ENV=TAVILY_API_KEY ./chat.sh",
     ]
     boxed("Help", rows)
@@ -1125,14 +1156,31 @@ def metaclaw_run(metaclaw_bin: str, prompt: str, state: SessionState) -> tuple[b
         pass
 
     runtime_target = get_runtime_target()
-    attempts = llm_attempts_ready() if LLM_CONFIG_FILE.exists() else llm_attempts_all()
-    if not attempts:
-        attempts = llm_attempts_all()
+    attempts_all = llm_attempts_all()
+    if not attempts_all:
+        RESPONSE_FILE.write_text("[meta error] no LLM attempts configured\n", encoding="utf-8")
+        return False, 0.0
+
+    # Never silently "switch providers" because a key is missing. If the default
+    # provider/model is selected, require a usable key for that attempt.
+    default_attempt = attempts_all[0]
+    if pick_first_set_env_key(default_attempt) is None:
+        needed = ", ".join(key_env_candidates(str(default_attempt.get("keyEnv", "")).strip()))
+        RESPONSE_FILE.write_text(
+            "[meta error] LLM key is missing.\n"
+            f"Set one of: {needed}\n"
+            "Or run: /llm key\n",
+            encoding="utf-8",
+        )
+        return False, 0.0
+
+    # Default first; fallbacks must also have a usable key.
+    attempts = [default_attempt] + [a for a in attempts_all[1:] if pick_first_set_env_key(a) is not None]
 
     start = time.time()
     last_err_text = ""
     for i, attempt in enumerate(attempts):
-        key_env = str(attempt.get("keyEnv", "")).strip() or get_key_env_name()
+        key_env = pick_first_set_env_key(attempt) or get_key_env_name()
         llm_override = attempt if LLM_CONFIG_FILE.exists() and attempt.get("providerId") != "legacy" else None
         agent_file = write_effective_agent(state.network_mode, state.vault_access, llm_attempt=llm_override)
 
@@ -1641,7 +1689,7 @@ def llm_status_rows() -> list[str]:
     if not LLM_CONFIG_FILE.exists():
         return [
             f"{c('mode:', '1;33')} legacy (no llm.config.json yet)",
-            f"{c('key env:', '1;33')} {os.getenv('LLM_KEY_ENV', 'GEMINI_API_KEY')} ({'set' if key_is_ready() else 'missing'})",
+            f"{c('key env:', '1;33')} {os.getenv('LLM_KEY_ENV', 'OPENAI_FORMAT_API_KEY')} ({'set' if key_is_ready() else 'missing'})",
             "",
             "Tip: run `/llm setup` to pick providers/models and store a default.",
         ]
