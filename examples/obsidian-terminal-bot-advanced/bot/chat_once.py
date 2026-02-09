@@ -425,7 +425,7 @@ def tool_agent_spawn(args: dict) -> dict:
         {"role": "system", "content": system},
         {"role": "user", "content": task},
     ]
-    output = call_openai_compatible(messages, model_override=model)
+    output = call_llm(messages, model_override=model)
     return {"ok": True, "name": name, "output": output}
 
 
@@ -577,7 +577,7 @@ def run_tool_loop(user_prompt: str, history: list[dict], vault_context: str, web
 
     last_raw = ""
     for step in range(max(1, TOOL_MAX_STEPS)):
-        raw = call_openai_compatible(messages)
+        raw = call_llm(messages)
         last_raw = raw
         obj = extract_first_json_object(raw)
         if not obj or "type" not in obj:
@@ -920,6 +920,139 @@ def call_openai_compatible(messages: list, *, model_override: str | None = None)
         return "\n".join(p for p in parts if p).strip()
 
     return str(message).strip()
+
+
+def llm_provider_id() -> str:
+    return (os.getenv("METACLAW_LLM_PROVIDER", "") or "").strip().lower()
+
+
+def call_llm(messages: list, *, model_override: str | None = None) -> str:
+    provider = llm_provider_id()
+    if provider == "anthropic":
+        return call_anthropic(messages, model_override=model_override)
+    # Default: OpenAI-compatible chat/completions (OpenAI, Gemini OpenAI endpoint, custom gateways, etc.).
+    return call_openai_compatible(messages, model_override=model_override)
+
+
+def call_anthropic(messages: list, *, model_override: str | None = None) -> str:
+    base_url = (
+        os.getenv("ANTHROPIC_BASE_URL")
+        or os.getenv("METACLAW_LLM_BASE_URL")
+        or "https://api.anthropic.com/v1"
+    ).rstrip("/")
+    endpoint = base_url + "/messages"
+
+    api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("missing ANTHROPIC_API_KEY in container env")
+
+    model = (model_override or "").strip() or os.getenv("METACLAW_LLM_MODEL") or "claude-3-5-sonnet-latest"
+
+    # Convert OpenAI-style messages into Anthropic Messages API.
+    system = ""
+    out_messages = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role", "")).strip()
+        content = m.get("content", "")
+        if isinstance(content, list):
+            # Normalize content blocks to a plain string.
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+            content = "\n".join(p for p in parts if p).strip()
+        if not isinstance(content, str):
+            content = str(content)
+        content = content.strip()
+        if not content:
+            continue
+        if role == "system" and not system:
+            system = content
+            continue
+        if role not in {"user", "assistant"}:
+            role = "user"
+        out_messages.append({"role": role, "content": content})
+
+    if not out_messages:
+        out_messages = [{"role": "user", "content": "Hello"}]
+
+    payload = {
+        "model": model,
+        "max_tokens": 1400,
+        "temperature": 0.2,
+        "messages": out_messages,
+    }
+    if system:
+        payload["system"] = system
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": os.getenv("ANTHROPIC_VERSION", "2023-06-01"),
+        },
+    )
+
+    def retry_sleep(attempt: int) -> None:
+        base = max(0.05, LLM_RETRY_BASE_SEC) * (2 ** max(0, attempt))
+        delay = min(max(0.05, base + random.uniform(0, base * 0.25)), max(0.2, LLM_RETRY_MAX_SEC))
+        time.sleep(delay)
+
+    def is_transient_http(code: int) -> bool:
+        return code in {408, 425, 429, 500, 502, 503, 504}
+
+    last_err: Exception | None = None
+    raw = ""
+    for attempt in range(max(0, LLM_MAX_RETRIES) + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            last_err = None
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            if attempt < LLM_MAX_RETRIES and is_transient_http(int(getattr(e, "code", 0) or 0)):
+                audit_tool(
+                    {
+                        "tool": "llm.retry",
+                        "id": None,
+                        "ok": False,
+                        "elapsed_sec": 0.0,
+                        "detail": f"http {e.code} transient",
+                    }
+                )
+                retry_sleep(attempt)
+                last_err = e
+                continue
+            raise RuntimeError(f"llm http {e.code}: {body[:500]}") from e
+        except Exception as e:
+            if attempt < LLM_MAX_RETRIES:
+                retry_sleep(attempt)
+                last_err = e
+                continue
+            raise RuntimeError(f"llm request failed: {e}") from e
+    else:  # pragma: no cover
+        raise RuntimeError(f"llm request failed after retries: {last_err}") from last_err
+
+    try:
+        obj = json.loads(raw)
+        blocks = obj.get("content")
+        if isinstance(blocks, list):
+            parts = []
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    parts.append(str(b.get("text", "")))
+            return "\n".join(p for p in parts if p).strip()
+        # Fallback
+        return str(obj).strip()
+    except Exception as e:
+        raise RuntimeError(f"unexpected llm response: {raw[:500]}") from e
 
 
 def write_response(text: str) -> None:

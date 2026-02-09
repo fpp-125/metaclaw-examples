@@ -108,15 +108,17 @@ FOCUS_CHOICES = [
 LLM_PROVIDER_CATALOG: dict[str, dict] = {
     "gemini_openai": {
         "id": "gemini_openai",
-        "label": "Gemini (OpenAI-compatible)",
+        "label": "Gemini",
         "engineProvider": "gemini_openai",
         "baseURL": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        # Host-side env var holding the API key value. This is intentionally
-        # provider-agnostic so quickstarts can use a single env name.
-        "keyEnv": "OPENAI_FORMAT_API_KEY",
+        "keyEnv": "GEMINI_API_KEY",
         "models": [
             "gemini-3-flash-preview",
-            # Keep the list short and allow custom additions in `/llm setup`.
+            "gemini-3-pro-preview",
+            "gemini-2.0-flash",
+            "gemini-2.0-pro",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
         ],
     },
     "openai": {
@@ -124,13 +126,28 @@ LLM_PROVIDER_CATALOG: dict[str, dict] = {
         "label": "OpenAI",
         "engineProvider": "openai_compatible",
         "baseURL": "https://api.openai.com/v1",
-        # Same host env name as other OpenAI-compatible providers by default.
-        "keyEnv": "OPENAI_FORMAT_API_KEY",
+        "keyEnv": "OPENAI_API_KEY",
         "models": [
             "gpt-4o-mini",
             "gpt-4o",
             "gpt-4.1-mini",
             "gpt-4.1",
+            "o1-mini",
+            "o1",
+        ],
+    },
+    "anthropic": {
+        "id": "anthropic",
+        "label": "Anthropic (Claude)",
+        "engineProvider": "anthropic",
+        "baseURL": "https://api.anthropic.com/v1",
+        "keyEnv": "ANTHROPIC_API_KEY",
+        "models": [
+            "claude-3-5-haiku-latest",
+            "claude-3-5-sonnet-latest",
+            "claude-3-opus-20240229",
+            "claude-3-sonnet-20240229",
+            "claude-3-haiku-20240307",
         ],
     },
 }
@@ -1034,6 +1051,11 @@ def rewrite_llm_block(agent_text: str, attempt: dict) -> str:
     if not engine_provider or not model:
         return agent_text
 
+    # Container-side key env depends on provider protocol.
+    container_key_env = "OPENAI_API_KEY"
+    if engine_provider == "anthropic":
+        container_key_env = "ANTHROPIC_API_KEY"
+
     lines = agent_text.splitlines()
     in_llm = False
     llm_indent = 0
@@ -1072,8 +1094,8 @@ def rewrite_llm_block(agent_text: str, attempt: dict) -> str:
                 lines[i] = prefix + f"baseURL: {base_url}"
                 seen["baseURL"] = True
         elif key == "apiKeyEnv":
-            # Always inject into OPENAI_API_KEY inside the container; host env name is controlled by --llm-api-key-env.
-            lines[i] = prefix + "apiKeyEnv: OPENAI_API_KEY"
+            # Keep secrets in host env; container always reads a provider-appropriate env name.
+            lines[i] = prefix + f"apiKeyEnv: {container_key_env}"
             seen["apiKeyEnv"] = True
 
     if llm_line_idx is None:
@@ -1090,7 +1112,7 @@ def rewrite_llm_block(agent_text: str, attempt: dict) -> str:
     if base_url and not seen["baseURL"]:
         inserts.append(indent + f"baseURL: {base_url}")
     if not seen["apiKeyEnv"]:
-        inserts.append(indent + "apiKeyEnv: OPENAI_API_KEY")
+        inserts.append(indent + f"apiKeyEnv: {container_key_env}")
     if inserts:
         lines = lines[:insert_at] + inserts + lines[insert_at:]
 
@@ -1769,12 +1791,197 @@ def llm_collect_keys(cfg: dict, provider_ids: list[str]) -> None:
         print(c("meta> keys kept in current process env only", "2"))
 
 
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,64}$")
+
+
+def is_valid_env_name(name: str) -> bool:
+    return bool(_ENV_NAME_RE.match((name or "").strip()))
+
+
+def sanitize_provider_id(raw: str) -> str:
+    s = (raw or "").strip().lower()
+    s = re.sub(r"[^a-z0-9_-]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    if not s:
+        return ""
+    if not s[0].isalpha():
+        s = "p-" + s
+    s = s[:64]
+    return s
+
+
+def suggested_key_env_for_provider(pid: str) -> str:
+    if pid in LLM_PROVIDER_CATALOG:
+        return str(LLM_PROVIDER_CATALOG[pid].get("keyEnv", "")).strip()
+    base = re.sub(r"[^A-Za-z0-9]+", "_", (pid or "custom")).upper().strip("_") or "CUSTOM"
+    return f"{base}_API_KEY"
+
+
+def llm_provider_choices(cfg: dict) -> list[tuple[str, str]]:
+    choices: list[tuple[str, str]] = []
+    # Built-ins first (stable order).
+    for pid in LLM_PROVIDER_CATALOG.keys():
+        choices.append((pid, str(LLM_PROVIDER_CATALOG[pid].get("label", pid)).strip() or pid))
+    # Then any custom providers already present in cfg.
+    providers = cfg.get("providers", []) if isinstance(cfg.get("providers"), list) else []
+    custom: list[tuple[str, str]] = []
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("id", "")).strip()
+        if not pid or pid in LLM_PROVIDER_CATALOG:
+            continue
+        label = str(p.get("label", "")).strip() or pid
+        custom.append((pid, f"{label} (custom)"))
+    # stable ordering for customs
+    custom.sort(key=lambda x: x[0])
+    choices.extend(custom)
+    return choices
+
+
+def llm_add_custom_provider(cfg: dict) -> dict:
+    cfg = cfg if isinstance(cfg, dict) else default_llm_config()
+    providers = cfg.get("providers", []) if isinstance(cfg.get("providers"), list) else []
+
+    print(c("meta> add custom provider (OpenAI-compatible or Anthropic)", "2"))
+
+    label = input(c("Provider name (label): ", "2")).strip()
+    if not label:
+        print(c("meta> cancelled (empty label)", "33"))
+        return cfg
+    pid_default = sanitize_provider_id(label)
+    pid = input(c(f"Provider id [{pid_default}]: ", "2")).strip() or pid_default
+    pid = sanitize_provider_id(pid)
+    if not pid or not _PROVIDER_ID_RE.match(pid):
+        print(c("meta> invalid provider id (use lowercase letters, numbers, '-' '_')", "31"))
+        return cfg
+
+    protocol = prompt_menu(
+        "Provider protocol",
+        [
+            ("openai_compatible", "OpenAI-compatible (chat/completions)"),
+            ("anthropic", "Anthropic (Claude) (v1/messages)"),
+        ],
+        "openai_compatible",
+    )
+    if protocol is None:
+        return cfg
+
+    base_url = input(c("Base URL (e.g. https://api.openai.com/v1): ", "2")).strip()
+    if not base_url:
+        print(c("meta> cancelled (empty base URL)", "33"))
+        return cfg
+
+    key_env_default = suggested_key_env_for_provider(pid)
+    key_env = input(c(f"API key env name [{key_env_default}]: ", "2")).strip() or key_env_default
+    if not is_valid_env_name(key_env):
+        print(c("meta> invalid env var name", "31"))
+        return cfg
+
+    models_raw = input(c("Models (comma separated; optional): ", "2")).strip()
+    models = [m.strip() for m in models_raw.split(",") if m.strip()] if models_raw else []
+    if not models:
+        models = ["gpt-4o-mini"] if protocol == "openai_compatible" else ["claude-3-5-sonnet-latest"]
+    selected_models = [models[0]]
+
+    # Upsert provider in cfg.
+    new_entry = {
+        "id": pid,
+        "label": label,
+        "engineProvider": protocol,
+        "baseURL": base_url,
+        "keyEnv": key_env,
+        "models": models,
+        "selectedModels": selected_models,
+    }
+    replaced = False
+    for i, p in enumerate(providers):
+        if isinstance(p, dict) and str(p.get("id", "")).strip() == pid:
+            providers[i] = new_entry
+            replaced = True
+            break
+    if not replaced:
+        providers.append(new_entry)
+    cfg["providers"] = providers
+    cfg = normalize_llm_config(cfg)
+
+    # Collect key (optional) right away.
+    try:
+        value = getpass.getpass(f"Enter {key_env} value (hidden; leave empty to skip): ")
+    except Exception:
+        value = ""
+    value = (value or "").strip()
+    if value:
+        os.environ[key_env] = value
+        save = prompt_menu("Save this key into .env (gitignored)?", [("yes", "yes"), ("no", "no")], "yes")
+        if save == "yes":
+            try:
+                dotenv_upsert(DOTENV_FILE, {key_env: value})
+                print(c("meta> key saved to .env", "2"))
+            except Exception as exc:
+                print(c(f"meta> failed to write .env: {exc}", "33"))
+        else:
+            print(c("meta> key kept in current process env only", "2"))
+
+    print(c(f"meta> added provider: {label} ({pid})", "1;32"))
+    return cfg
+
+
+def llm_delete_custom_providers(cfg: dict) -> dict:
+    cfg = cfg if isinstance(cfg, dict) else default_llm_config()
+    providers = cfg.get("providers", []) if isinstance(cfg.get("providers"), list) else []
+    custom = []
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("id", "")).strip()
+        if pid and pid not in LLM_PROVIDER_CATALOG:
+            label = str(p.get("label", "")).strip() or pid
+            custom.append((pid, f"{label} (custom)"))
+    if not custom:
+        print(c("meta> no custom providers to delete", "2"))
+        return cfg
+    to_del = prompt_multiselect("Delete custom providers", custom, [])
+    if to_del is None:
+        return cfg
+    if not to_del:
+        print(c("meta> nothing selected", "2"))
+        return cfg
+    cfg["providers"] = [p for p in providers if not (isinstance(p, dict) and str(p.get("id", "")).strip() in set(to_del))]
+    cfg = normalize_llm_config(cfg)
+    print(c(f"meta> deleted: {', '.join(to_del)}", "1;32"))
+    return cfg
+
+
 def llm_setup_interactive() -> None:
-    # Step 1: providers (multi-select)
+    # Optional: manage custom providers first.
     existing_cfg = load_llm_config() if LLM_CONFIG_FILE.exists() else default_llm_config()
+    while True:
+        action = prompt_menu(
+            "LLM setup",
+            [
+                ("continue", "continue"),
+                ("add_custom", "add custom provider"),
+                ("del_custom", "delete custom provider"),
+            ],
+            "continue",
+        )
+        if action is None:
+            return
+        if action == "add_custom":
+            existing_cfg = llm_add_custom_provider(existing_cfg)
+            continue
+        if action == "del_custom":
+            existing_cfg = llm_delete_custom_providers(existing_cfg)
+            continue
+        break
+
+    # Step 1: providers (multi-select)
     existing_ids = [str(p.get("id", "")).strip() for p in existing_cfg.get("providers", []) if isinstance(p, dict)]
-    provider_choices = [(pid, LLM_PROVIDER_CATALOG[pid]["label"]) for pid in LLM_PROVIDER_CATALOG.keys()]
-    selected_ids = prompt_multiselect("LLM providers", provider_choices, existing_ids)
+    initial_ids = existing_ids if LLM_CONFIG_FILE.exists() else []
+    provider_choices = llm_provider_choices(existing_cfg)
+    selected_ids = prompt_multiselect("LLM providers", provider_choices, initial_ids)
     if selected_ids is None:
         return
     if not selected_ids:
@@ -1821,10 +2028,10 @@ def llm_setup_interactive() -> None:
         new_providers.append(
             {
                 "id": pid,
-                "label": str(cat.get("label", pid)).strip() or pid,
-                "engineProvider": str(cat.get("engineProvider", "")).strip(),
-                "baseURL": str(cat.get("baseURL", "")).strip(),
-                "keyEnv": str(cat.get("keyEnv", "")).strip(),
+                "label": (str((prev or {}).get("label", "")).strip() or str(cat.get("label", pid)).strip() or pid),
+                "engineProvider": (str((prev or {}).get("engineProvider", "")).strip() or str(cat.get("engineProvider", "")).strip()),
+                "baseURL": (str((prev or {}).get("baseURL", "")).strip() or str(cat.get("baseURL", "")).strip()),
+                "keyEnv": (str((prev or {}).get("keyEnv", "")).strip() or str(cat.get("keyEnv", "")).strip()),
                 "models": models,
                 "selectedModels": selected_models,
             }
