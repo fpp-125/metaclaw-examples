@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "obsidian-terminal-bot-advanced",
+  "managed": [
+    "bot/**",
+    "image/**",
+    "chat_tui.py",
+    "build_image.sh",
+    "README.md",
+    ".env.example"
+  ],
+  "user": [
+    "agent.claw",
+    "chat.sh",
+    ".env",
+    ".metaclaw/**",
+    "vault/**"
+  ]
+}
+

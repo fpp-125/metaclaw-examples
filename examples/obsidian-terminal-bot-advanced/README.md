@@ -28,6 +28,21 @@ cd examples/obsidian-terminal-bot-advanced
 
 `build_image.sh` compiles image `metaclaw/obsidian-terminal-bot:local`, resolves digest, and updates `agent.claw`.
 
+## Upgrade (In Place)
+
+If this project was created via `metaclaw quickstart/onboard`, it includes a template lock under `.metaclaw/`.
+You can refresh managed template files (bot business code + image layer) without overwriting your `agent.claw`, `.env`, or `vault/`:
+
+```bash
+metaclaw project upgrade --project-dir=.
+```
+
+After upgrading, rebuild the image to pick up the updated `bot/` code:
+
+```bash
+RUNTIME_BIN=container ./build_image.sh
+```
+
 ## Friend Setup (Engine + Advanced Bot)
 
 ```bash
