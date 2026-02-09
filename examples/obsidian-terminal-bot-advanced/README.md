@@ -119,6 +119,32 @@ Command menu keys:
 ## Security Notes
 
 - Default network is `none`; use `/net out` only when needed.
-- Vault is mounted read-only inside container.
+- Vault is mounted read-only inside container by default.
 - Save to vault happens on host side via `/save`, with scope limits and confirmation.
 - API keys are runtime-injected (`--llm-api-key-env`, `--secret-env`), not committed into files.
+
+## Option B (Less Safe): Let The Container Write The Vault Directly
+
+If you want the bot process inside the container to create/modify files under `/vault`, you can mount the vault as read-write.
+
+In `agent.claw`, change the vault mount:
+
+```yaml
+    mounts:
+      - source: /ABS/PATH/TO/OBSIDIAN_VAULT
+        target: /vault
+        readOnly: false
+```
+
+Notes:
+- This example bot still defaults to host-side `/save`. Vault write access only changes what the container is *allowed* to do.
+- This bypasses the host-side `/save` guardrails. Treat it as **unsafe-by-default**.
+- If you enabled outbound network access, a compromised bot can both read your vault and exfiltrate it.
+- Mitigations: keep backups, prefer mounting a smaller subfolder instead of the whole vault, and keep network `none` unless you explicitly need it.
+
+If you created this project via engine quickstart/onboard, you can enable this mode up front with:
+
+```bash
+metaclaw quickstart obsidian --vault-write ...
+metaclaw onboard obsidian --vault-write ...
+```

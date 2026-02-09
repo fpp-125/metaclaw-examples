@@ -16,7 +16,7 @@ agent:
     mounts:
       - source: /ABS/PATH/TO/OBSIDIAN_VAULT
         target: /vault
-        readOnly: true
+        readOnly: true # set false to let the container write the vault (less safe)
       - source: /ABS/PATH/TO/BOT_HOST_DATA/config
         target: /config
         readOnly: true
