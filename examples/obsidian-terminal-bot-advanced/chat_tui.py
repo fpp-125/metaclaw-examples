@@ -57,6 +57,7 @@ ALLOWED_SAVE_ROOTS = ("Research", "Learning")
 DEFAULT_VALUES = {
     "network_mode": "none",
     "render_mode": "glow",
+    "vault_access": "ro",
     "retrieval_scope": "limited",
     "write_confirm_mode": "enter_once",
     "save_default_dir": "Research/Market-Reports",
@@ -65,6 +66,10 @@ DEFAULT_VALUES = {
 NETWORK_CHOICES = [
     ("none", "none"),
     ("outbound", "out"),
+]
+VAULT_CHOICES = [
+    ("ro", "vault ro (recommended)"),
+    ("rw", "vault rw (less safe)"),
 ]
 RENDER_CHOICES = [
     ("plain", "plain"),
@@ -85,6 +90,7 @@ CONFIRM_CHOICES = [
 class SessionState:
     network_mode: str
     render_mode: str
+    vault_access: str
     retrieval_scope: str
     write_confirm_mode: str
     save_default_dir: str
@@ -190,6 +196,22 @@ def normalize_render_mode(mode: str) -> str:
     return mode
 
 
+def normalize_vault_access(value: str) -> str:
+    value = value.strip().lower()
+    aliases = {
+        "read-only": "ro",
+        "readonly": "ro",
+        "read_only": "ro",
+        "read-write": "rw",
+        "readwrite": "rw",
+        "read_write": "rw",
+    }
+    value = aliases.get(value, value)
+    if value not in {"ro", "rw"}:
+        return DEFAULT_VALUES["vault_access"]
+    return value
+
+
 def normalize_scope(scope: str) -> str:
     scope = scope.strip().lower()
     if scope not in {"limited", "all"}:
@@ -220,6 +242,14 @@ def sanitize_default_dir(value: str) -> str:
 
 def load_defaults() -> dict[str, str]:
     out = dict(DEFAULT_VALUES)
+
+    # Align with the current agent.claw unless user overrides in ui.defaults.json.
+    ro = read_vault_readonly_from_agent()
+    if ro is False:
+        out["vault_access"] = "rw"
+    elif ro is True:
+        out["vault_access"] = "ro"
+
     if not DEFAULTS_FILE.exists():
         return out
     try:
@@ -234,6 +264,8 @@ def load_defaults() -> dict[str, str]:
             out["network_mode"] = normalize_network_mode(payload["network_mode"])
         if isinstance(payload.get("render_mode"), str):
             out["render_mode"] = normalize_render_mode(payload["render_mode"])
+        if isinstance(payload.get("vault_access"), str):
+            out["vault_access"] = normalize_vault_access(payload["vault_access"])
         if isinstance(payload.get("retrieval_scope"), str):
             out["retrieval_scope"] = normalize_scope(payload["retrieval_scope"])
         if isinstance(payload.get("write_confirm_mode"), str):
@@ -249,6 +281,7 @@ def save_defaults(values: dict[str, str]) -> None:
     payload = {
         "network_mode": normalize_network_mode(values.get("network_mode", DEFAULT_VALUES["network_mode"])),
         "render_mode": normalize_render_mode(values.get("render_mode", DEFAULT_VALUES["render_mode"])),
+        "vault_access": normalize_vault_access(values.get("vault_access", DEFAULT_VALUES["vault_access"])),
         "retrieval_scope": normalize_scope(values.get("retrieval_scope", DEFAULT_VALUES["retrieval_scope"])),
         "write_confirm_mode": normalize_confirm_mode(values.get("write_confirm_mode", DEFAULT_VALUES["write_confirm_mode"])),
         "save_default_dir": sanitize_default_dir(values.get("save_default_dir", DEFAULT_VALUES["save_default_dir"])),
@@ -271,6 +304,10 @@ def get_runtime_target() -> str:
 
 def network_mode_label(mode: str) -> str:
     return "out" if mode == "outbound" else "none"
+
+
+def vault_access_label(mode: str) -> str:
+    return "rw" if normalize_vault_access(mode) == "rw" else "ro"
 
 
 def has_glow() -> bool:
@@ -300,6 +337,7 @@ def print_banner(metaclaw_bin: str, state: SessionState) -> None:
         f"{c('Agent:', '1;33')}   {AGENT_FILE.name}",
         f"{c('Runtime:', '1;33')} {get_runtime_target()}",
         f"{c('Network:', '1;33')} {network_mode_label(state.network_mode)}",
+        f"{c('Vault:', '1;33')}   {vault_access_label(state.vault_access)}",
         f"{c('Scope:', '1;33')}   {state.retrieval_scope}",
         f"{c('Confirm:', '1;33')} {confirm_mode_label(state.write_confirm_mode)}",
         f"{c('Render:', '1;33')}  {state.render_mode}" + (" (glow ready)" if has_glow() else ""),
@@ -308,7 +346,7 @@ def print_banner(metaclaw_bin: str, state: SessionState) -> None:
         f"{c('Host data:', '1;33')} {HOST_DATA_DIR}",
         f"{c('MetaClaw:', '1;33')} {metaclaw_bin}",
         "",
-        f"{c('Commands:', '1;32')} /help /status /model /history /render /net /scope /confirm /save /reset /clear /exit",
+        f"{c('Commands:', '1;32')} /help /status /model /history /render /net /vault /scope /confirm /save /reset /clear /exit",
     ]
     boxed("MetaClaw Obsidian Terminal Bot", rows)
 
@@ -323,6 +361,7 @@ def print_help() -> None:
         f"{c('/history', '1;32')}    Show recent local conversation turns",
         f"{c('/render', '1;32')}     Show or set render mode (/render plain|glow|demo [--default])",
         f"{c('/net', '1;32')}        Show or set network mode (/net none|out [--default])",
+        f"{c('/vault', '1;32')}      Show or set vault access (/vault ro|rw [--default])",
         f"{c('/scope', '1;32')}      Show or set retrieval scope (/scope limited|all [--default])",
         f"{c('/confirm', '1;32')}    Show or set write confirm mode (/confirm once|diff|auto [--default])",
         f"{c('/save', '1;32')}       Save last bot output to vault (/save <rel.md> | /save --default-dir <dir> [--default])",
@@ -447,7 +486,7 @@ def spinner_wait(proc: subprocess.Popen, label: str = "running") -> None:
     sys.stdout.flush()
 
 
-def write_effective_agent(network_mode: str) -> Path:
+def write_effective_agent(network_mode: str, vault_access: str) -> Path:
     raw = AGENT_FILE.read_text(encoding="utf-8")
     if network_mode == "none":
         updated = raw.replace("mode: outbound", "mode: none", 1)
@@ -456,6 +495,8 @@ def write_effective_agent(network_mode: str) -> Path:
 
     if updated == raw and f"mode: {network_mode}" not in raw:
         raise RuntimeError("cannot resolve habitat.network.mode in agent.claw")
+
+    updated = set_mount_readonly_by_target(updated, "/vault", normalize_vault_access(vault_access) == "ro")
 
     EFFECTIVE_AGENT_FILE.write_text(updated, encoding="utf-8")
     return EFFECTIVE_AGENT_FILE
@@ -474,7 +515,7 @@ def metaclaw_run(metaclaw_bin: str, prompt: str, state: SessionState) -> tuple[b
     if RESPONSE_FILE.exists():
         RESPONSE_FILE.unlink()
 
-    agent_file = write_effective_agent(state.network_mode)
+    agent_file = write_effective_agent(state.network_mode, state.vault_access)
 
     run_args = [
         metaclaw_bin,
@@ -511,6 +552,7 @@ def local_status(state: SessionState) -> None:
     rows = [
         f"{c('Runtime target:', '1;33')} {get_runtime_target()}",
         f"{c('Network mode:', '1;33')} {network_mode_label(state.network_mode)}",
+        f"{c('Vault access:', '1;33')} {vault_access_label(state.vault_access)}",
         f"{c('Scope mode:', '1;33')} {state.retrieval_scope}",
         f"{c('Confirm mode:', '1;33')} {confirm_mode_label(state.write_confirm_mode)}",
         f"{c('Render mode:', '1;33')} {state.render_mode}" + (" (glow ready)" if has_glow() else " (glow missing)"),
@@ -703,6 +745,9 @@ def apply_mode_change(
     elif key == "render_mode":
         state.render_mode = normalize_render_mode(value)
         display = state.render_mode
+    elif key == "vault_access":
+        state.vault_access = normalize_vault_access(value)
+        display = vault_access_label(state.vault_access)
     elif key == "retrieval_scope":
         state.retrieval_scope = normalize_scope(value)
         display = state.retrieval_scope
@@ -717,6 +762,7 @@ def apply_mode_change(
         defaults[key] = value
         defaults["network_mode"] = normalize_network_mode(defaults["network_mode"])
         defaults["render_mode"] = normalize_render_mode(defaults["render_mode"])
+        defaults["vault_access"] = normalize_vault_access(defaults.get("vault_access", DEFAULT_VALUES["vault_access"]))
         defaults["retrieval_scope"] = normalize_scope(defaults["retrieval_scope"])
         defaults["write_confirm_mode"] = normalize_confirm_mode(defaults["write_confirm_mode"])
         save_defaults(defaults)
@@ -749,6 +795,96 @@ def find_vault_root_from_agent() -> Path:
 
     # Safe fallback for this project layout.
     return PROJECT_DIR.parent.resolve()
+
+
+def read_vault_readonly_from_agent() -> bool | None:
+    """Best-effort parse of agent.claw to find readOnly for the /vault mount."""
+    if not AGENT_FILE.exists():
+        return None
+    try:
+        text = AGENT_FILE.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    in_vault_mount = False
+    for line in text.splitlines():
+        src_match = re.match(r"\s*-\s*source:\s*(.+)$", line)
+        if src_match:
+            in_vault_mount = False
+            continue
+
+        tgt_match = re.match(r"\s*target:\s*(.+)$", line)
+        if tgt_match:
+            target = parse_agent_yaml_scalar(tgt_match.group(1))
+            in_vault_mount = target == "/vault"
+            continue
+
+        ro_match = re.match(r"\s*readOnly:\s*(.+)$", line)
+        if ro_match and in_vault_mount:
+            raw = parse_agent_yaml_scalar(ro_match.group(1)).strip().lower()
+            if raw in {"true", "yes", "1"}:
+                return True
+            if raw in {"false", "no", "0"}:
+                return False
+            return None
+
+    return None
+
+
+def set_mount_readonly_by_target(agent_text: str, target: str, read_only: bool) -> str:
+    """Set or insert `readOnly` for the mount item whose `target` matches."""
+    lines = agent_text.splitlines()
+    in_mounts = False
+    mounts_indent = 0
+
+    def indent_len(s: str) -> int:
+        return len(s) - len(s.lstrip(" \t"))
+
+    for i, line in enumerate(lines):
+        trimmed = line.strip()
+        indent = indent_len(line)
+
+        if trimmed == "mounts:":
+            in_mounts = True
+            mounts_indent = indent
+            continue
+
+        if in_mounts and indent <= mounts_indent and trimmed and not trimmed.startswith("-"):
+            in_mounts = False
+
+        if not in_mounts:
+            continue
+
+        m = re.match(r"\s*target:\s*(.+)$", line)
+        if not m:
+            continue
+        tgt = parse_agent_yaml_scalar(m.group(1))
+        if tgt != target:
+            continue
+
+        desired = " " * indent + f"readOnly: {'true' if read_only else 'false'}"
+
+        # Look ahead within this mount item for existing readOnly.
+        insert_at = i + 1
+        for j in range(i + 1, len(lines)):
+            jline = lines[j]
+            jtrim = jline.strip()
+            jindent = indent_len(jline)
+
+            # Next mount item (same list level) or leaving mounts block.
+            if jindent <= mounts_indent + 2 and jtrim.startswith("-"):
+                break
+            if jindent <= mounts_indent and jtrim and not jtrim.startswith("-"):
+                break
+
+            if jtrim.startswith("readOnly:"):
+                lines[j] = desired
+                return "\n".join(lines)
+
+        lines.insert(insert_at, desired)
+        return "\n".join(lines)
+
+    return agent_text
 
 
 def sanitize_vault_relative_path(raw: str, require_md: bool = True) -> PurePosixPath:
@@ -958,6 +1094,7 @@ def main() -> int:
     state = SessionState(
         network_mode=normalize_network_mode(defaults["network_mode"]),
         render_mode=normalize_render_mode(defaults["render_mode"]),
+        vault_access=normalize_vault_access(defaults["vault_access"]),
         retrieval_scope=normalize_scope(defaults["retrieval_scope"]),
         write_confirm_mode=normalize_confirm_mode(defaults["write_confirm_mode"]),
         save_default_dir=sanitize_default_dir(defaults["save_default_dir"]),
@@ -966,6 +1103,7 @@ def main() -> int:
     # Environment overrides are session-only.
     state.network_mode = normalize_network_mode(os.getenv("BOT_NETWORK_MODE", state.network_mode))
     state.render_mode = normalize_render_mode(os.getenv("BOT_RENDER_MODE", state.render_mode))
+    state.vault_access = normalize_vault_access(os.getenv("BOT_VAULT_ACCESS", state.vault_access))
 
     print_banner(metaclaw_bin, state)
 
@@ -1047,6 +1185,24 @@ def main() -> int:
                     print(c("meta> usage: /net none|out [--default]", "31"))
                     continue
                 apply_mode_change(state, defaults, "network_mode", selected, persist)
+                continue
+
+            if cmd == "/vault":
+                value, persist = parse_value_and_default(args)
+                selected = None
+                if value is None:
+                    selected = prompt_select("vault", VAULT_CHOICES, state.vault_access)
+                else:
+                    selected = value.lower()
+                if selected is None:
+                    continue
+                selected = normalize_vault_access(selected)
+                if selected not in {"ro", "rw"}:
+                    print(c("meta> usage: /vault ro|rw [--default]", "31"))
+                    continue
+                if selected == "rw":
+                    print(c("meta> WARNING: vault will be mounted read-write inside the container (less safe)", "33"))
+                apply_mode_change(state, defaults, "vault_access", selected, persist)
                 continue
 
             if cmd == "/scope":

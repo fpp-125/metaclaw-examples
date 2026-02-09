@@ -100,6 +100,7 @@ METACLAW_BIN=/abs/path/to/metaclaw ./chat.sh
 - `/history`
 - `/render` or `/render plain|glow|demo`
 - `/net` or `/net none|out [--default]`
+- `/vault` or `/vault ro|rw [--default]`
 - `/scope` or `/scope limited|all [--default]`
 - `/confirm` or `/confirm once|diff|auto [--default]`
 - `/save <Research/.../file.md>`
