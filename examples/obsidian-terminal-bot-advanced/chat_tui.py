@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as dt
 import difflib
+import getpass
 import json
 import os
 import re
@@ -43,8 +44,14 @@ INPUT_HISTORY_FILE = RUNTIME_DIR / ".cli_input_history"
 RUN_LOG_FILE = Path("/tmp/metaclaw_chat_run.log")
 EFFECTIVE_AGENT_FILE = RUNTIME_DIR / "agent.effective.claw"
 DEFAULTS_FILE = HOST_CONFIG_DIR / "ui.defaults.json"
+LLM_CONFIG_FILE = HOST_CONFIG_DIR / "llm.config.json"
 WRITE_AUDIT_FILE = HOST_LOG_DIR / "write_audit.jsonl"
 LAST_RESPONSE_MD_FILE = RUNTIME_DIR / "last_response.md"
+AGENTS_CONTEXT_FILE = RUNTIME_DIR / "agents_context.md"
+DOTENV_FILE = PROJECT_DIR / ".env"
+AGENTS_DIR = PROJECT_DIR / "agents"
+AGENTS_FILE = AGENTS_DIR / "AGENTS.md"
+SOUL_FILE = AGENTS_DIR / "soul.md"
 
 DEFAULT_METACLAW_BIN = "metaclaw"
 FALLBACK_METACLAW_BINS = (
@@ -97,6 +104,33 @@ FOCUS_CHOICES = [
     ("stay", "stay"),
     ("input", "input"),
 ]
+
+LLM_PROVIDER_CATALOG: dict[str, dict] = {
+    "gemini_openai": {
+        "id": "gemini_openai",
+        "label": "Gemini (OpenAI-compatible)",
+        "engineProvider": "gemini_openai",
+        "baseURL": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "keyEnv": "GEMINI_API_KEY",
+        "models": [
+            "gemini-3-flash-preview",
+            # Keep the list short and allow custom additions in `/llm setup`.
+        ],
+    },
+    "openai": {
+        "id": "openai",
+        "label": "OpenAI",
+        "engineProvider": "openai_compatible",
+        "baseURL": "https://api.openai.com/v1",
+        "keyEnv": "OPENAI_API_KEY",
+        "models": [
+            "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-4.1-mini",
+            "gpt-4.1",
+        ],
+    },
+}
 
 
 @dataclass
@@ -334,7 +368,205 @@ def save_defaults(values: dict[str, str]) -> None:
     DEFAULTS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def default_llm_config() -> dict:
+    gem = LLM_PROVIDER_CATALOG["gemini_openai"]
+    model = gem["models"][0]
+    return {
+        "schemaVersion": 1,
+        "providers": [
+            {
+                "id": gem["id"],
+                "label": gem["label"],
+                "engineProvider": gem["engineProvider"],
+                "baseURL": gem["baseURL"],
+                "keyEnv": gem["keyEnv"],
+                "models": list(gem["models"]),
+                "selectedModels": [model],
+            }
+        ],
+        "default": {"providerId": gem["id"], "model": model},
+    }
+
+
+def load_llm_config() -> dict:
+    cfg = default_llm_config()
+    if not LLM_CONFIG_FILE.exists():
+        return cfg
+    try:
+        payload = json.loads(LLM_CONFIG_FILE.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return cfg
+    if not isinstance(payload, dict):
+        return cfg
+
+    # Shallow-merge known fields.
+    try:
+        if isinstance(payload.get("schemaVersion"), int):
+            cfg["schemaVersion"] = payload["schemaVersion"]
+        if isinstance(payload.get("providers"), list):
+            cfg["providers"] = payload["providers"]
+        if isinstance(payload.get("default"), dict):
+            cfg["default"] = payload["default"]
+    except Exception:
+        return default_llm_config()
+
+    return normalize_llm_config(cfg)
+
+
+def save_llm_config(cfg: dict) -> None:
+    cfg = normalize_llm_config(cfg)
+    LLM_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LLM_CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def normalize_llm_config(cfg: dict) -> dict:
+    # Ensure a minimal, stable shape.
+    out = {"schemaVersion": 1, "providers": [], "default": {"providerId": "", "model": ""}}
+    if isinstance(cfg, dict):
+        if isinstance(cfg.get("schemaVersion"), int):
+            out["schemaVersion"] = int(cfg["schemaVersion"]) or 1
+        if isinstance(cfg.get("providers"), list):
+            out["providers"] = [p for p in cfg["providers"] if isinstance(p, dict)]
+        if isinstance(cfg.get("default"), dict):
+            out["default"] = dict(cfg["default"])
+
+    # Fill in from catalog where possible.
+    normalized_providers: list[dict] = []
+    for p in out["providers"]:
+        pid = str(p.get("id", "")).strip()
+        if not pid:
+            continue
+        cat = LLM_PROVIDER_CATALOG.get(pid, {})
+        label = str(p.get("label") or cat.get("label") or pid).strip()
+        engine_provider = str(p.get("engineProvider") or cat.get("engineProvider") or "").strip()
+        base_url = str(p.get("baseURL") or cat.get("baseURL") or "").strip()
+        key_env = str(p.get("keyEnv") or cat.get("keyEnv") or "").strip()
+        models = p.get("models")
+        if not isinstance(models, list) or not models:
+            models = list(cat.get("models") or [])
+        models = [str(m).strip() for m in models if str(m).strip()]
+        # De-dupe while preserving order.
+        seen = set()
+        models = [m for m in models if not (m in seen or seen.add(m))]
+
+        selected = p.get("selectedModels")
+        if not isinstance(selected, list) or not selected:
+            selected = [p.get("model")] if isinstance(p.get("model"), str) else []
+        selected = [str(m).strip() for m in selected if str(m).strip()]
+        selected = [m for m in selected if m in models] or (models[:1] if models else [])
+
+        normalized_providers.append(
+            {
+                "id": pid,
+                "label": label,
+                "engineProvider": engine_provider,
+                "baseURL": base_url,
+                "keyEnv": key_env,
+                "models": models,
+                "selectedModels": selected,
+            }
+        )
+
+    if not normalized_providers:
+        return default_llm_config()
+    out["providers"] = normalized_providers
+
+    # Default selection.
+    d = out.get("default") if isinstance(out.get("default"), dict) else {}
+    default_pid = str(d.get("providerId", "")).strip()
+    default_model = str(d.get("model", "")).strip()
+    if default_pid not in {p["id"] for p in normalized_providers}:
+        default_pid = normalized_providers[0]["id"]
+    provider = next((p for p in normalized_providers if p["id"] == default_pid), normalized_providers[0])
+    if default_model not in set(provider.get("selectedModels") or []):
+        default_model = (provider.get("selectedModels") or provider.get("models") or [""])[0]
+    out["default"] = {"providerId": default_pid, "model": default_model}
+    return out
+
+
+def dotenv_read(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    out: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if k:
+            out[k] = v
+    return out
+
+
+def dotenv_upsert(path: Path, updates: dict[str, str]) -> None:
+    updates = {str(k).strip(): str(v).strip() for k, v in updates.items() if str(k).strip()}
+    if not updates:
+        return
+    if any("\n" in v or "\r" in v for v in updates.values()):
+        raise ValueError("dotenv values cannot contain newlines")
+
+    lines: list[str] = []
+    existing: dict[str, int] = {}
+    if path.exists():
+        raw_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        for i, raw in enumerate(raw_lines):
+            lines.append(raw)
+            s = raw.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k = s.split("=", 1)[0].strip()
+            if k and k not in existing:
+                existing[k] = i
+    else:
+        lines = ["# Runtime-only secrets (never commit actual values)"]
+
+    for k, v in updates.items():
+        if k in existing:
+            lines[existing[k]] = f"{k}={v}"
+        else:
+            lines.append(f"{k}={v}")
+
+    if lines and lines[-1].strip() != "":
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def write_agents_context() -> None:
+    parts: list[str] = []
+    try:
+        if AGENTS_FILE.exists():
+            parts.append("# AGENTS.md\n\n" + AGENTS_FILE.read_text(encoding="utf-8", errors="ignore").strip())
+    except Exception:
+        pass
+    try:
+        if SOUL_FILE.exists():
+            parts.append("# soul.md\n\n" + SOUL_FILE.read_text(encoding="utf-8", errors="ignore").strip())
+    except Exception:
+        pass
+    if not parts:
+        return
+    AGENTS_CONTEXT_FILE.write_text("\n\n---\n\n".join(parts) + "\n", encoding="utf-8")
+
+
 def get_key_env_name() -> str:
+    # Backward compatible behavior:
+    # - If no llm.config.json exists yet, fall back to the legacy single-env name (LLM_KEY_ENV).
+    # - If llm.config.json exists, prefer the configured default provider key env.
+    if not LLM_CONFIG_FILE.exists():
+        return os.getenv("LLM_KEY_ENV", "GEMINI_API_KEY")
+    cfg = load_llm_config()
+    default_pid = str((cfg.get("default") or {}).get("providerId", "")).strip()
+    for p in cfg.get("providers", []) if isinstance(cfg.get("providers"), list) else []:
+        if isinstance(p, dict) and str(p.get("id", "")).strip() == default_pid:
+            key_env = str(p.get("keyEnv", "")).strip()
+            if key_env:
+                return key_env
     return os.getenv("LLM_KEY_ENV", "GEMINI_API_KEY")
 
 
@@ -383,6 +615,90 @@ def web_key_is_ready() -> bool:
     return bool(os.getenv(get_web_key_env_name()))
 
 
+def llm_attempts_all() -> list[dict]:
+    """Return ordered LLM (provider, model) attempts for this session.
+
+    The first entry is always the default. Additional entries are fallbacks.
+    Each attempt dict contains:
+      - providerId, providerLabel
+      - engineProvider, baseURL, model
+      - keyEnv (host env var name holding the key)
+    """
+    if not LLM_CONFIG_FILE.exists():
+        # Legacy mode: use whatever agent.claw declares, but read the key from a single host env name.
+        return [
+            {
+                "providerId": "legacy",
+                "providerLabel": "agent.claw",
+                "engineProvider": "",
+                "baseURL": "",
+                "model": "",
+                "keyEnv": get_key_env_name(),
+            }
+        ]
+
+    cfg = load_llm_config()
+    providers = cfg.get("providers", []) if isinstance(cfg.get("providers"), list) else []
+    default = cfg.get("default") if isinstance(cfg.get("default"), dict) else {}
+    default_pid = str(default.get("providerId", "")).strip()
+    default_model = str(default.get("model", "")).strip()
+
+    attempts: list[dict] = []
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("id", "")).strip()
+        label = str(p.get("label", "")).strip() or pid
+        engine_provider = str(p.get("engineProvider", "")).strip()
+        base_url = str(p.get("baseURL", "")).strip()
+        key_env = str(p.get("keyEnv", "")).strip()
+        selected = p.get("selectedModels") if isinstance(p.get("selectedModels"), list) else []
+        selected_models = [str(m).strip() for m in selected if str(m).strip()]
+        if not selected_models:
+            continue
+
+        # Default first, then remaining models.
+        ordered_models = selected_models[:]
+        if pid == default_pid and default_model in ordered_models:
+            ordered_models.remove(default_model)
+            ordered_models.insert(0, default_model)
+
+        for m in ordered_models:
+            attempts.append(
+                {
+                    "providerId": pid,
+                    "providerLabel": label,
+                    "engineProvider": engine_provider,
+                    "baseURL": base_url,
+                    "model": m,
+                    "keyEnv": key_env,
+                }
+            )
+
+    # Ensure default combo is first overall.
+    if default_pid and default_model:
+        for i, a in enumerate(attempts):
+            if a["providerId"] == default_pid and a["model"] == default_model:
+                if i != 0:
+                    attempts.insert(0, attempts.pop(i))
+                break
+    return attempts
+
+
+def llm_attempts_ready() -> list[dict]:
+    return [a for a in llm_attempts_all() if str(a.get("keyEnv", "")).strip() and os.getenv(str(a.get("keyEnv", "")).strip())]
+
+
+def llm_default_display() -> str:
+    attempts = llm_attempts_all()
+    if not attempts:
+        return "unknown"
+    a = attempts[0]
+    if a.get("providerId") == "legacy":
+        return "agent.claw"
+    return f"{a.get('providerLabel', a.get('providerId'))}/{a.get('model', '')}".strip("/")
+
+
 def print_banner(metaclaw_bin: str, state: SessionState) -> None:
     rows = [
         f"{c('Project:', '1;33')} {PROJECT_DIR}",
@@ -394,12 +710,13 @@ def print_banner(metaclaw_bin: str, state: SessionState) -> None:
         f"{c('Confirm:', '1;33')} {confirm_mode_label(state.write_confirm_mode)}",
         f"{c('Render:', '1;33')}  {state.render_mode}" + (" (glow ready)" if has_glow() else ""),
         f"{c('Focus:', '1;33')}   {focus_label(state.output_focus)}",
+        f"{c('LLM:', '1;33')}     {llm_default_display()}",
         f"{c('LLM key:', '1;33')} {get_key_env_name()} {'(set)' if key_is_ready() else '(missing)'}",
         f"{c('Web key:', '1;33')} {get_web_key_env_name()} {'(set)' if web_key_is_ready() else '(missing)'}",
         f"{c('Host data:', '1;33')} {HOST_DATA_DIR}",
         f"{c('MetaClaw:', '1;33')} {metaclaw_bin}",
         "",
-        f"{c('Commands:', '1;32')} /help /status /model /history /render /focus /show /net /vault /scope /confirm /save /append /touch /reset /clear /exit",
+        f"{c('Commands:', '1;32')} /help /status /llm /history /render /focus /show /net /vault /scope /confirm /save /append /touch /reset /clear /exit",
     ]
     boxed("MetaClaw Obsidian Terminal Bot", rows)
 
@@ -410,7 +727,10 @@ def print_help() -> None:
         "",
         f"{c('/help', '1;32')}       Show this help",
         f"{c('/status', '1;32')}     Show runtime/key/model status",
-        f"{c('/model', '1;32')}      Ask agent to report configured model",
+        f"{c('/llm', '1;32')}        Show LLM provider/model/key status",
+        f"{c('/llm setup', '1;32')}  Interactive provider/model/key setup (multi-select)",
+        f"{c('/llm use', '1;32')}    Switch default provider/model",
+        f"{c('/llm key', '1;32')}    Update API keys (hidden input, optional .env write)",
         f"{c('/history', '1;32')}    Show recent local conversation turns",
         f"{c('/render', '1;32')}     Show or set render mode (/render plain|glow|demo [--default])",
         f"{c('/focus', '1;32')}      Where you land after a response (/focus start|end|stay|input [--default])",
@@ -675,7 +995,78 @@ def spinner_wait(proc: subprocess.Popen, label: str = "running") -> None:
     sys.stdout.flush()
 
 
-def write_effective_agent(network_mode: str, vault_access: str) -> Path:
+def rewrite_llm_block(agent_text: str, attempt: dict) -> str:
+    """Best-effort YAML rewrite for agent.llm fields (no YAML parser dependency)."""
+    engine_provider = str(attempt.get("engineProvider", "")).strip()
+    model = str(attempt.get("model", "")).strip()
+    base_url = str(attempt.get("baseURL", "")).strip()
+    if not engine_provider or not model:
+        return agent_text
+
+    lines = agent_text.splitlines()
+    in_llm = False
+    llm_indent = 0
+    seen = {"provider": False, "model": False, "baseURL": False, "apiKeyEnv": False}
+    llm_line_idx: int | None = None
+
+    def indent_len(s: str) -> int:
+        return len(s) - len(s.lstrip(" \t"))
+
+    for i, line in enumerate(lines):
+        trimmed = line.strip()
+        indent = indent_len(line)
+        if trimmed == "llm:":
+            in_llm = True
+            llm_indent = indent
+            llm_line_idx = i
+            continue
+        if in_llm and indent <= llm_indent and trimmed and not trimmed.startswith("#"):
+            in_llm = False
+        if not in_llm:
+            continue
+
+        key_match = re.match(r"\s*([A-Za-z0-9_]+):\s*(.*)$", line)
+        if not key_match:
+            continue
+        key = key_match.group(1)
+        prefix = line[:indent]
+        if key == "provider":
+            lines[i] = prefix + f"provider: {engine_provider}"
+            seen["provider"] = True
+        elif key == "model":
+            lines[i] = prefix + f"model: {model}"
+            seen["model"] = True
+        elif key == "baseURL":
+            if base_url:
+                lines[i] = prefix + f"baseURL: {base_url}"
+                seen["baseURL"] = True
+        elif key == "apiKeyEnv":
+            # Always inject into OPENAI_API_KEY inside the container; host env name is controlled by --llm-api-key-env.
+            lines[i] = prefix + "apiKeyEnv: OPENAI_API_KEY"
+            seen["apiKeyEnv"] = True
+
+    if llm_line_idx is None:
+        return agent_text
+
+    # Insert missing keys right after `llm:` line, in a stable order.
+    insert_at = llm_line_idx + 1
+    indent = " " * (llm_indent + 2)
+    inserts: list[str] = []
+    if not seen["provider"]:
+        inserts.append(indent + f"provider: {engine_provider}")
+    if not seen["model"]:
+        inserts.append(indent + f"model: {model}")
+    if base_url and not seen["baseURL"]:
+        inserts.append(indent + f"baseURL: {base_url}")
+    if not seen["apiKeyEnv"]:
+        inserts.append(indent + "apiKeyEnv: OPENAI_API_KEY")
+    if inserts:
+        lines = lines[:insert_at] + inserts + lines[insert_at:]
+
+    return "\n".join(lines)
+
+
+def write_effective_agent(network_mode: str, vault_access: str, *, llm_attempt: dict | None) -> Path:
     raw = AGENT_FILE.read_text(encoding="utf-8")
     if network_mode == "none":
         updated = raw.replace("mode: outbound", "mode: none", 1)
@@ -686,6 +1077,8 @@ def write_effective_agent(network_mode: str, vault_access: str) -> Path:
         raise RuntimeError("cannot resolve habitat.network.mode in agent.claw")
 
     updated = set_mount_readonly_by_target(updated, "/vault", normalize_vault_access(vault_access) == "ro")
+    if llm_attempt is not None and llm_attempt.get("providerId") != "legacy":
+        updated = rewrite_llm_block(updated, llm_attempt)
 
     EFFECTIVE_AGENT_FILE.write_text(updated, encoding="utf-8")
     return EFFECTIVE_AGENT_FILE
@@ -698,43 +1091,97 @@ def write_session_config(state: SessionState) -> None:
     SESSION_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def is_transient_bot_error(text: str) -> bool:
+    lower = (text or "").lower()
+    patterns = [
+        "http 408",
+        "http 425",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "remote end closed connection",
+        "timed out",
+        "temporarily unavailable",
+        "connection reset",
+        "connection aborted",
+        "unavailable",
+        "overloaded",
+    ]
+    return any(p in lower for p in patterns)
+
+
 def metaclaw_run(metaclaw_bin: str, prompt: str, state: SessionState) -> tuple[bool, float]:
     REQUEST_FILE.write_text(prompt, encoding="utf-8")
     write_session_config(state)
     if RESPONSE_FILE.exists():
         RESPONSE_FILE.unlink()
 
-    agent_file = write_effective_agent(state.network_mode, state.vault_access)
-
-    run_args = [
-        metaclaw_bin,
-        "run",
-        str(agent_file),
-        f"--state-dir={STATE_DIR}",
-        f"--llm-api-key-env={get_key_env_name()}",
-    ]
-    web_key_env = get_web_key_env_name()
-    if os.getenv(web_key_env):
-        run_args.append(f"--secret-env={web_key_env}")
+    # Keep agent context (AGENTS.md + soul.md) synced into the mounted runtime dir.
+    try:
+        write_agents_context()
+    except Exception:
+        pass
 
     runtime_target = get_runtime_target()
-    if runtime_target != "auto":
-        run_args.append(f"--runtime={runtime_target}")
+    attempts = llm_attempts_ready() if LLM_CONFIG_FILE.exists() else llm_attempts_all()
+    if not attempts:
+        attempts = llm_attempts_all()
 
-    with RUN_LOG_FILE.open("w", encoding="utf-8") as lf:
-        start = time.time()
-        proc = subprocess.Popen(
-            run_args,
-            stdout=lf,
-            stderr=subprocess.STDOUT,
-            cwd=str(PROJECT_DIR),
-            env=os.environ.copy(),
-            text=True,
-        )
-        spinner_wait(proc, label=f"{runtime_target}/{network_mode_label(state.network_mode)} executing")
-        rc = proc.wait()
-        elapsed = time.time() - start
-    return rc == 0, elapsed
+    start = time.time()
+    last_err_text = ""
+    for i, attempt in enumerate(attempts):
+        key_env = str(attempt.get("keyEnv", "")).strip() or get_key_env_name()
+        llm_override = attempt if LLM_CONFIG_FILE.exists() and attempt.get("providerId") != "legacy" else None
+        agent_file = write_effective_agent(state.network_mode, state.vault_access, llm_attempt=llm_override)
+
+        run_args = [
+            metaclaw_bin,
+            "run",
+            str(agent_file),
+            f"--state-dir={STATE_DIR}",
+            f"--llm-api-key-env={key_env}",
+        ]
+        web_key_env = get_web_key_env_name()
+        if os.getenv(web_key_env):
+            run_args.append(f"--secret-env={web_key_env}")
+        if runtime_target != "auto":
+            run_args.append(f"--runtime={runtime_target}")
+
+        if i > 0:
+            label = attempt.get("providerLabel", attempt.get("providerId", "llm"))
+            model = attempt.get("model", "")
+            print(c(f"meta> retrying with fallback: {label}/{model}", "33"))
+
+        with RUN_LOG_FILE.open("w", encoding="utf-8") as lf:
+            proc = subprocess.Popen(
+                run_args,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                cwd=str(PROJECT_DIR),
+                env=os.environ.copy(),
+                text=True,
+            )
+            spinner_wait(proc, label=f"{runtime_target}/{network_mode_label(state.network_mode)} executing")
+            rc = proc.wait()
+
+        if rc == 0:
+            return True, time.time() - start
+
+        err_text = read_response_text()
+        last_err_text = err_text
+        if i < len(attempts) - 1 and err_text.startswith("[bot error]") and is_transient_bot_error(err_text):
+            continue
+        break
+
+    # Failure
+    if last_err_text:
+        try:
+            RESPONSE_FILE.write_text(last_err_text + "\n", encoding="utf-8")
+        except Exception:
+            pass
+    return False, time.time() - start
 
 
 def local_status(state: SessionState) -> None:
@@ -747,6 +1194,7 @@ def local_status(state: SessionState) -> None:
         f"{c('Render mode:', '1;33')} {state.render_mode}" + (" (glow ready)" if has_glow() else " (glow missing)"),
         f"{c('Focus mode:', '1;33')} {focus_label(state.output_focus)}",
         f"{c('Save default dir:', '1;33')} {state.save_default_dir}",
+        f"{c('LLM default:', '1;33')} {llm_default_display()}",
         f"{c('LLM key env:', '1;33')} {get_key_env_name()} {'(set)' if key_is_ready() else '(missing)'}",
         f"{c('Web key env:', '1;33')} {get_web_key_env_name()} {'(set)' if web_key_is_ready() else '(missing)'}",
         f"{c('Host data dir:', '1;33')} {HOST_DATA_DIR}",
@@ -803,15 +1251,41 @@ def read_response_text() -> str:
 
 
 def prompt_uses_llm(prompt: str) -> bool:
-    return prompt.strip() != "/model"
+    # Any non-TUI command that reaches the runtime will require an LLM call.
+    return True
 
 
 def check_key_env_or_warn(prompt: str) -> bool:
-    key_env = get_key_env_name()
-    if not os.getenv(key_env):
-        print(c(f"meta> missing LLM API key env: {key_env}", "31"))
-        print(c(f"meta> example: export {key_env}=your_key", "2"))
-        return False
+    if LLM_CONFIG_FILE.exists():
+        ready = llm_attempts_ready()
+        if not ready:
+            cfg = load_llm_config()
+            envs = []
+            for p in cfg.get("providers", []) if isinstance(cfg.get("providers"), list) else []:
+                if isinstance(p, dict):
+                    k = str(p.get("keyEnv", "")).strip()
+                    if k:
+                        envs.append(k)
+            envs = sorted(set(envs))
+            print(c("meta> missing LLM API key(s) for selected providers", "31"))
+            if envs:
+                print(c("meta> set one of these env vars (or run /llm key):", "2"))
+                for k in envs:
+                    print(c(f"  export {k}=your_key", "2"))
+            else:
+                print(c("meta> run /llm setup to configure providers/models", "2"))
+            return False
+        # If default key is missing but another provider is available, warn but proceed.
+        default_env = get_key_env_name()
+        if default_env and not os.getenv(default_env):
+            print(c(f"meta> WARNING: default LLM key env {default_env} is missing; will use a fallback provider/model", "33"))
+    else:
+        key_env = get_key_env_name()
+        if not os.getenv(key_env):
+            print(c(f"meta> missing LLM API key env: {key_env}", "31"))
+            print(c(f"meta> example: export {key_env}=your_key", "2"))
+            print(c("meta> tip: run /llm setup for multi-provider config", "2"))
+            return False
 
     web_key_env = get_web_key_env_name()
     if prompt.startswith("/web ") and not os.getenv(web_key_env):
@@ -922,6 +1396,206 @@ def prompt_select(title: str, choices: list[tuple[str, str]], current_value: str
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
+def prompt_menu(title: str, choices: list[tuple[str, str]], current_value: str | None = None) -> str | None:
+    """Vertical single-select menu (arrow keys + Enter)."""
+    if not choices:
+        return None
+    values = [v for v, _ in choices]
+    idx = 0
+    if current_value and current_value in values:
+        idx = values.index(current_value)
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        labels = ", ".join(f"{label}={value}" for value, label in choices)
+        print(c(f"meta> {title} options: {labels}", "2"))
+        print(c("meta> non-interactive terminal; pass explicit value", "2"))
+        return None
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    hint = "(use ↑/↓, Enter; q cancel)"
+    lines = len(choices) + 1
+
+    def crlf() -> None:
+        sys.stdout.write("\r\n")
+
+    def print_line(s: str) -> None:
+        sys.stdout.write("\r\x1b[2K")
+        sys.stdout.write(s)
+        crlf()
+
+    def render() -> None:
+        print_line(f"{c('meta>', '1;35')} {title} {c(hint, '2')}")
+        for i, (value, label) in enumerate(choices):
+            prefix = "> " if i == idx else "  "
+            text = label
+            if i == idx:
+                text = c(label, "1;32")
+            print_line(prefix + text)
+
+    def clear_menu() -> None:
+        # Move cursor to the top of the menu and clear below.
+        sys.stdout.write(f"\x1b[{lines}A\r\x1b[J")
+
+    def redraw() -> None:
+        clear_menu()
+        render()
+        sys.stdout.flush()
+
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\x1b[?25l")
+        sys.stdout.flush()
+        render()
+        sys.stdout.flush()
+
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in {"q", "Q", "\x03"}:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return None
+            if ch in {"\r", "\n", " "}:
+                clear_menu()
+                sys.stdout.write("\x1b[?25h")
+                sys.stdout.flush()
+                return choices[idx][0]
+            if ch in {"k", "K"}:
+                idx = (idx - 1) % len(choices)
+                redraw()
+                continue
+            if ch in {"j", "J"}:
+                idx = (idx + 1) % len(choices)
+                redraw()
+                continue
+            if ch == "\x1b":
+                nxt = sys.stdin.read(1)
+                if nxt != "[":
+                    continue
+                arrow = sys.stdin.read(1)
+                if arrow == "A":  # up
+                    idx = (idx - 1) % len(choices)
+                    redraw()
+                    continue
+                if arrow == "B":  # down
+                    idx = (idx + 1) % len(choices)
+                    redraw()
+                    continue
+                continue
+    finally:
+        try:
+            sys.stdout.write("\x1b[?25h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def prompt_multiselect(title: str, choices: list[tuple[str, str]], initial: list[str] | None = None) -> list[str] | None:
+    """Vertical multi-select menu (arrow keys, space toggles, Enter confirms)."""
+    if not choices:
+        return None
+    selected: set[str] = set(str(x).strip() for x in (initial or []) if str(x).strip())
+    idx = 0
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        labels = ", ".join(f"{label}={value}" for value, label in choices)
+        print(c(f"meta> {title} options: {labels}", "2"))
+        print(c("meta> non-interactive terminal; pass explicit value", "2"))
+        return None
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    hint = "(use ↑/↓, space toggle, Enter done; q cancel)"
+    lines = len(choices) + 1
+
+    def crlf() -> None:
+        sys.stdout.write("\r\n")
+
+    def print_line(s: str) -> None:
+        sys.stdout.write("\r\x1b[2K")
+        sys.stdout.write(s)
+        crlf()
+
+    def render() -> None:
+        print_line(f"{c('meta>', '1;35')} {title} {c(hint, '2')}")
+        for i, (value, label) in enumerate(choices):
+            checked = value in selected
+            box = "[x]" if checked else "[ ]"
+            prefix = "> " if i == idx else "  "
+            line = f"{box} {label}"
+            if i == idx:
+                line = c(line, "1;32")
+            print_line(prefix + line)
+
+    def clear_menu() -> None:
+        sys.stdout.write(f"\x1b[{lines}A\r\x1b[J")
+
+    def redraw() -> None:
+        clear_menu()
+        render()
+        sys.stdout.flush()
+
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\x1b[?25l")
+        sys.stdout.flush()
+        render()
+        sys.stdout.flush()
+
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in {"q", "Q", "\x03"}:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return None
+            if ch in {"\r", "\n"}:
+                clear_menu()
+                sys.stdout.write("\x1b[?25h")
+                sys.stdout.flush()
+                # Stable order: follow choices order.
+                out = [value for value, _ in choices if value in selected]
+                return out
+            if ch == " ":
+                value = choices[idx][0]
+                if value in selected:
+                    selected.remove(value)
+                else:
+                    selected.add(value)
+                redraw()
+                continue
+            if ch in {"k", "K"}:
+                idx = (idx - 1) % len(choices)
+                redraw()
+                continue
+            if ch in {"j", "J"}:
+                idx = (idx + 1) % len(choices)
+                redraw()
+                continue
+            if ch == "\x1b":
+                nxt = sys.stdin.read(1)
+                if nxt != "[":
+                    continue
+                arrow = sys.stdin.read(1)
+                if arrow == "A":
+                    idx = (idx - 1) % len(choices)
+                    redraw()
+                    continue
+                if arrow == "B":
+                    idx = (idx + 1) % len(choices)
+                    redraw()
+                    continue
+                continue
+    finally:
+        try:
+            sys.stdout.write("\x1b[?25h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
 def apply_mode_change(
     state: SessionState,
     defaults: dict[str, str],
@@ -961,6 +1635,213 @@ def apply_mode_change(
         defaults["output_focus"] = normalize_focus(defaults.get("output_focus", DEFAULT_VALUES["output_focus"]))
         save_defaults(defaults)
         print(c("meta> saved as project default", "2"))
+
+
+def llm_status_rows() -> list[str]:
+    if not LLM_CONFIG_FILE.exists():
+        return [
+            f"{c('mode:', '1;33')} legacy (no llm.config.json yet)",
+            f"{c('key env:', '1;33')} {os.getenv('LLM_KEY_ENV', 'GEMINI_API_KEY')} ({'set' if key_is_ready() else 'missing'})",
+            "",
+            "Tip: run `/llm setup` to pick providers/models and store a default.",
+        ]
+
+    cfg = load_llm_config()
+    default = cfg.get("default") if isinstance(cfg.get("default"), dict) else {}
+    default_pid = str(default.get("providerId", "")).strip()
+    default_model = str(default.get("model", "")).strip()
+    rows: list[str] = []
+    rows.append(f"{c('default:', '1;33')} {llm_default_display()}")
+    rows.append("")
+    providers = cfg.get("providers", []) if isinstance(cfg.get("providers"), list) else []
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("id", "")).strip()
+        label = str(p.get("label", "")).strip() or pid
+        key_env = str(p.get("keyEnv", "")).strip()
+        key_state = "set" if (key_env and os.getenv(key_env)) else "missing"
+        selected = p.get("selectedModels") if isinstance(p.get("selectedModels"), list) else []
+        selected_models = [str(m).strip() for m in selected if str(m).strip()]
+        model_list = ", ".join(selected_models) if selected_models else "(none)"
+        default_mark = ""
+        if pid == default_pid:
+            default_mark = c("  [default provider]", "2")
+        rows.append(f"{c(label+':', '1;33')} {model_list}{default_mark}")
+        if key_env:
+            rows.append(f"  key env: {key_env} ({key_state})")
+        if pid == default_pid and default_model:
+            rows.append(f"  default model: {default_model}")
+        rows.append("")
+    if rows and rows[-1] == "":
+        rows.pop()
+    return rows
+
+
+def llm_show_status() -> None:
+    boxed("LLM", llm_status_rows())
+
+
+def llm_collect_keys(cfg: dict, provider_ids: list[str]) -> None:
+    updates: dict[str, str] = {}
+    providers = cfg.get("providers", []) if isinstance(cfg.get("providers"), list) else []
+    id_set = set(provider_ids)
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        if str(p.get("id", "")).strip() not in id_set:
+            continue
+        label = str(p.get("label", "")).strip() or str(p.get("id", "")).strip()
+        key_env = str(p.get("keyEnv", "")).strip()
+        if not key_env:
+            continue
+        prompt = f"Enter {key_env} for {label} (hidden; leave empty to skip): "
+        try:
+            value = getpass.getpass(prompt)
+        except Exception:
+            value = ""
+        value = (value or "").strip()
+        if not value:
+            continue
+        os.environ[key_env] = value
+        updates[key_env] = value
+
+    if not updates:
+        print(c("meta> no keys updated", "2"))
+        return
+
+    save = prompt_menu("Save entered keys into .env (gitignored)?", [("yes", "yes"), ("no", "no")], "yes")
+    if save == "yes":
+        try:
+            dotenv_upsert(DOTENV_FILE, updates)
+            print(c("meta> keys saved to .env", "2"))
+        except Exception as exc:
+            print(c(f"meta> failed to write .env: {exc}", "33"))
+    else:
+        print(c("meta> keys kept in current process env only", "2"))
+
+
+def llm_setup_interactive() -> None:
+    # Step 1: providers (multi-select)
+    existing_cfg = load_llm_config() if LLM_CONFIG_FILE.exists() else default_llm_config()
+    existing_ids = [str(p.get("id", "")).strip() for p in existing_cfg.get("providers", []) if isinstance(p, dict)]
+    provider_choices = [(pid, LLM_PROVIDER_CATALOG[pid]["label"]) for pid in LLM_PROVIDER_CATALOG.keys()]
+    selected_ids = prompt_multiselect("LLM providers", provider_choices, existing_ids)
+    if selected_ids is None:
+        return
+    if not selected_ids:
+        print(c("meta> no providers selected", "33"))
+        return
+
+    # Step 2: models per provider (multi-select)
+    new_providers: list[dict] = []
+    for pid in selected_ids:
+        cat = LLM_PROVIDER_CATALOG.get(pid, {})
+        prev = next((p for p in existing_cfg.get("providers", []) if isinstance(p, dict) and str(p.get("id", "")).strip() == pid), None)
+        models = []
+        if isinstance(prev, dict) and isinstance(prev.get("models"), list):
+            models.extend([str(m).strip() for m in prev["models"] if str(m).strip()])
+        models.extend([str(m).strip() for m in (cat.get("models") or []) if str(m).strip()])
+        # de-dupe order
+        seen = set()
+        models = [m for m in models if not (m in seen or seen.add(m))]
+        if not models:
+            models = ["gpt-4o-mini"]
+
+        prev_sel = []
+        if isinstance(prev, dict) and isinstance(prev.get("selectedModels"), list):
+            prev_sel = [str(m).strip() for m in prev["selectedModels"] if str(m).strip()]
+        initial_sel = [m for m in prev_sel if m in models] or models[:1]
+
+        model_choices = [(m, m) for m in models]
+        selected_models = prompt_multiselect(f"Models for {cat.get('label', pid)}", model_choices, initial_sel)
+        if selected_models is None:
+            return
+        if not selected_models:
+            print(c("meta> you must select at least one model", "33"))
+            return
+
+        # Optional custom additions.
+        extra = input(c(f"meta> add custom models for {cat.get('label', pid)} (comma separated, optional): ", "2")).strip()
+        extra_models = [x.strip() for x in extra.split(",") if x.strip()] if extra else []
+        for m in extra_models:
+            if m not in models:
+                models.append(m)
+            if m not in selected_models:
+                selected_models.append(m)
+
+        new_providers.append(
+            {
+                "id": pid,
+                "label": str(cat.get("label", pid)).strip() or pid,
+                "engineProvider": str(cat.get("engineProvider", "")).strip(),
+                "baseURL": str(cat.get("baseURL", "")).strip(),
+                "keyEnv": str(cat.get("keyEnv", "")).strip(),
+                "models": models,
+                "selectedModels": selected_models,
+            }
+        )
+
+    # Step 3: choose default provider/model.
+    combo_choices: list[tuple[str, str]] = []
+    for p in new_providers:
+        label = str(p.get("label", "")).strip() or str(p.get("id", "")).strip()
+        pid = str(p.get("id", "")).strip()
+        for m in p.get("selectedModels", []) if isinstance(p.get("selectedModels"), list) else []:
+            m = str(m).strip()
+            if not m:
+                continue
+            combo_choices.append((f"{pid}::{m}", f"{label} / {m}"))
+
+    prev_default = existing_cfg.get("default") if isinstance(existing_cfg.get("default"), dict) else {}
+    prev_pid = str(prev_default.get("providerId", "")).strip()
+    prev_model = str(prev_default.get("model", "")).strip()
+    current_combo = f"{prev_pid}::{prev_model}" if prev_pid and prev_model else combo_choices[0][0]
+    picked = prompt_menu("Default LLM", combo_choices, current_combo)
+    if picked is None:
+        return
+    if "::" in picked:
+        default_pid, default_model = picked.split("::", 1)
+    else:
+        default_pid, default_model = new_providers[0]["id"], str(new_providers[0].get("selectedModels", [""])[0])
+
+    cfg = {"schemaVersion": 1, "providers": new_providers, "default": {"providerId": default_pid, "model": default_model}}
+    save_llm_config(cfg)
+    print(c(f"meta> LLM default set to {llm_default_display()}", "1;32"))
+
+    # Optional: keys.
+    update_keys = prompt_menu("Update API keys now?", [("yes", "yes"), ("no", "no")], "no")
+    if update_keys == "yes":
+        llm_collect_keys(cfg, [p["id"] for p in new_providers if p.get("id")])
+
+
+def llm_use_default() -> None:
+    if not LLM_CONFIG_FILE.exists():
+        print(c("meta> llm.config.json not found; run `/llm setup` first", "33"))
+        return
+    cfg = load_llm_config()
+    providers = cfg.get("providers", []) if isinstance(cfg.get("providers"), list) else []
+    combo_choices: list[tuple[str, str]] = []
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("id", "")).strip()
+        label = str(p.get("label", "")).strip() or pid
+        selected = p.get("selectedModels") if isinstance(p.get("selectedModels"), list) else []
+        for m in [str(x).strip() for x in selected if str(x).strip()]:
+            combo_choices.append((f"{pid}::{m}", f"{label} / {m}"))
+    if not combo_choices:
+        print(c("meta> no models selected; run `/llm setup`", "33"))
+        return
+    d = cfg.get("default") if isinstance(cfg.get("default"), dict) else {}
+    cur = f"{str(d.get('providerId','')).strip()}::{str(d.get('model','')).strip()}"
+    picked = prompt_menu("Default LLM", combo_choices, cur)
+    if picked is None:
+        return
+    pid, model = picked.split("::", 1)
+    cfg["default"] = {"providerId": pid, "model": model}
+    save_llm_config(cfg)
+    print(c(f"meta> LLM default set to {llm_default_display()}", "1;32"))
 
 
 def parse_agent_yaml_scalar(value: str) -> str:
@@ -1448,6 +2329,28 @@ def main() -> int:
                 continue
             cmd = tokens[0].lower()
             args = tokens[1:]
+
+            if cmd in {"/llm", "/model"}:
+                sub = args[0].lower() if args else ""
+                if sub in {"", "status"}:
+                    llm_show_status()
+                    continue
+                if sub == "setup":
+                    llm_setup_interactive()
+                    continue
+                if sub == "use":
+                    llm_use_default()
+                    continue
+                if sub == "key":
+                    if not LLM_CONFIG_FILE.exists():
+                        print(c("meta> llm.config.json not found; run `/llm setup` first", "33"))
+                        continue
+                    cfg = load_llm_config()
+                    provider_ids = [str(p.get("id", "")).strip() for p in cfg.get("providers", []) if isinstance(p, dict) and str(p.get("id", "")).strip()]
+                    llm_collect_keys(cfg, provider_ids)
+                    continue
+                print(c("meta> usage: /llm [status|setup|use|key]", "31"))
+                continue
 
             if cmd == "/render":
                 if args and args[0].lower() == "demo":

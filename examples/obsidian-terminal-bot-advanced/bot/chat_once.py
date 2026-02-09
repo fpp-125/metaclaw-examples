@@ -19,6 +19,7 @@ REQUEST_FILE = RUNTIME_DIR / "request.txt"
 RESPONSE_FILE = RUNTIME_DIR / "response.txt"
 HISTORY_FILE = RUNTIME_DIR / "history.json"
 SESSION_FILE = RUNTIME_DIR / "session.json"
+AGENTS_CONTEXT_FILE = RUNTIME_DIR / "agents_context.md"
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 TAVILY_API_URL = os.getenv("TAVILY_API_URL", "https://api.tavily.com/search").strip()
 LIMITED_SCOPE_PREFIXES = ("Research/", "Learning/")
@@ -41,12 +42,26 @@ LLM_MAX_RETRIES = int(os.getenv("BOT_LLM_MAX_RETRIES", "4").strip() or "4")
 LLM_RETRY_BASE_SEC = float(os.getenv("BOT_LLM_RETRY_BASE_SEC", "0.8").strip() or "0.8")
 LLM_RETRY_MAX_SEC = float(os.getenv("BOT_LLM_RETRY_MAX_SEC", "6.0").strip() or "6.0")
 
+AGENT_SPAWN_MAX = int(os.getenv("BOT_AGENT_SPAWN_MAX", "3").strip() or "3")
+
 DEFAULT_ALLOW_CMDS = "ls,find,grep"
 TOOL_ALLOW_CMDS = {
     c.strip()
     for c in (os.getenv("BOT_TOOL_ALLOW_CMDS", DEFAULT_ALLOW_CMDS) or DEFAULT_ALLOW_CMDS).split(",")
     if c.strip()
 }
+
+_agent_spawn_count = 0
+
+
+def read_agents_context() -> str:
+    # Best-effort: a missing file should not fail the bot.
+    try:
+        if AGENTS_CONTEXT_FILE.exists():
+            return AGENTS_CONTEXT_FILE.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        pass
+    return ""
 
 DEFAULT_ALLOWED_ROOTS = "/vault,/workspace"
 TOOL_ALLOWED_ROOTS = [
@@ -384,6 +399,36 @@ def tool_cmd_exec(args: dict) -> dict:
         return {"ok": False, "error": f"exec failed: {exc}"}
 
 
+def tool_agent_spawn(args: dict) -> dict:
+    """Spawn a reasoning-only sub-agent (no file tools).
+
+    This is implemented as an additional LLM call with a tighter system prompt.
+    """
+    global _agent_spawn_count
+    if _agent_spawn_count >= max(0, AGENT_SPAWN_MAX):
+        return {"ok": False, "error": f"spawn limit reached (max {AGENT_SPAWN_MAX})"}
+
+    name = str(args.get("name", "subagent")).strip() or "subagent"
+    task = str(args.get("task", "")).strip()
+    model = str(args.get("model", "")).strip() or None
+    if not task:
+        return {"ok": False, "error": "missing task"}
+
+    _agent_spawn_count += 1
+
+    system = (
+        "You are a specialist sub-agent.\n"
+        "You do not have file tools. You only produce reasoning and a concrete, useful output.\n"
+        "Return concise Markdown. Prefer checklists, edge cases, and next actions.\n"
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": task},
+    ]
+    output = call_openai_compatible(messages, model_override=model)
+    return {"ok": True, "name": name, "output": output}
+
+
 TOOL_IMPL = {
     "fs.list_dir": tool_fs_list_dir,
     "fs.read_file": tool_fs_read_file,
@@ -392,6 +437,7 @@ TOOL_IMPL = {
     "fs.touch": tool_fs_touch,
     "fs.search": tool_fs_search,
     "cmd.exec": tool_cmd_exec,
+    "agent.spawn": tool_agent_spawn,
 }
 
 
@@ -489,6 +535,7 @@ def run_tool_loop(user_prompt: str, history: list[dict], vault_context: str, web
         "- fs.append_file(path, content, create_dirs=true)\n"
         "- fs.touch(path, create_dirs=true)\n"
         f"- cmd.exec(argv, cwd='/workspace', timeout_sec)  # allowed commands: {allowed_cmds}\n\n"
+        "- agent.spawn(name, task, model?)  # reasoning-only sub-agent (no file tools)\n\n"
         "IMPORTANT:\n"
         "- Only use paths under /vault or /workspace.\n"
         "- Prefer fs.* tools for safety; use cmd.exec only when it is clearly simpler.\n"
@@ -499,6 +546,10 @@ def run_tool_loop(user_prompt: str, history: list[dict], vault_context: str, web
         "2) To finish:\n"
         "{\"type\":\"final\",\"markdown\":\"...clean markdown...\"}\n"
     )
+
+    agents_context = read_agents_context()
+    if agents_context:
+        system_prompt += "\n\n# Persistent Agent Context\n" + agents_context + "\n"
 
     valid_history = []
     for item in history:
@@ -767,7 +818,7 @@ def retrieve_web_context(query: str) -> str:
     return "\n\n".join(parts)
 
 
-def call_openai_compatible(messages: list) -> str:
+def call_openai_compatible(messages: list, *, model_override: str | None = None) -> str:
     base_url = (
         os.getenv("OPENAI_BASE_URL")
         or os.getenv("METACLAW_LLM_BASE_URL")
@@ -779,7 +830,7 @@ def call_openai_compatible(messages: list) -> str:
     if not api_key:
         raise RuntimeError("missing OPENAI_API_KEY/GEMINI_API_KEY in container env")
 
-    model = os.getenv("METACLAW_LLM_MODEL") or "gpt-4o-mini"
+    model = (model_override or "").strip() or os.getenv("METACLAW_LLM_MODEL") or "gpt-4o-mini"
 
     payload = {
         "model": model,

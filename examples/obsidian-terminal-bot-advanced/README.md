@@ -95,6 +95,11 @@ export TAVILY_API_KEY='...'
 ./chat.sh
 ```
 
+Or, let the TUI manage keys and provider/model selection:
+
+1. Start chat: `./chat.sh`
+2. Run: `/llm setup` (multi-select providers/models, hidden key input, optional `.env` write)
+
 Optional runtime override:
 
 ```bash
@@ -113,6 +118,10 @@ METACLAW_BIN=/abs/path/to/metaclaw ./chat.sh
 
 - `/help`
 - `/status`
+- `/llm` (show status)
+- `/llm setup` (choose providers/models, update keys)
+- `/llm use` (switch default model)
+- `/llm key` (update keys)
 - `/history`
 - `/render` or `/render plain|glow|demo`
 - `/focus` or `/focus start|end|stay|input [--default]`
@@ -126,7 +135,6 @@ METACLAW_BIN=/abs/path/to/metaclaw ./chat.sh
 - `/touch <Research/.../file.md>`
 - `/save --default-dir <Research/...> [--default]`
 - `/reset`
-- `/model`
 - `/web <query>`
 - `/clear`
 - `/exit`
@@ -151,8 +159,18 @@ The bot process runs inside the container and can (when policy allows):
 - list/read/search files under `/vault` and `/workspace`
 - write/append/touch files under `/vault` and `/workspace` (requires vault mount `rw` for vault writes)
 - run a small allowlisted set of commands via `cmd.exec` (default: `ls`, `find`, `grep`)
+- spawn reasoning-only sub-agents via `agent.spawn` (no file tools)
 
 Tool calls are best-effort audited to `logs/tool_audit.jsonl` (tool name + status + timing). API keys are never written to files.
+
+## AGENTS.md + soul.md
+
+This template includes `agents/AGENTS.md` and `agents/soul.md`.
+
+- `agents/AGENTS.md`: operational rules and tool contract (managed by template upgrades unless you modify it)
+- `agents/soul.md`: persona and style (user-owned; not overwritten by upgrades)
+
+The host TUI syncs both into the mounted runtime dir as `/runtime/agents_context.md` on each run.
 
 ## Security Notes
 
