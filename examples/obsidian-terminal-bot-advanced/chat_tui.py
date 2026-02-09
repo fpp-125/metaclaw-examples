@@ -346,7 +346,7 @@ def print_banner(metaclaw_bin: str, state: SessionState) -> None:
         f"{c('Host data:', '1;33')} {HOST_DATA_DIR}",
         f"{c('MetaClaw:', '1;33')} {metaclaw_bin}",
         "",
-        f"{c('Commands:', '1;32')} /help /status /model /history /render /net /vault /scope /confirm /save /reset /clear /exit",
+        f"{c('Commands:', '1;32')} /help /status /model /history /render /net /vault /scope /confirm /save /append /touch /reset /clear /exit",
     ]
     boxed("MetaClaw Obsidian Terminal Bot", rows)
 
@@ -365,6 +365,8 @@ def print_help() -> None:
         f"{c('/scope', '1;32')}      Show or set retrieval scope (/scope limited|all [--default])",
         f"{c('/confirm', '1;32')}    Show or set write confirm mode (/confirm once|diff|auto [--default])",
         f"{c('/save', '1;32')}       Save last bot output to vault (/save <rel.md> | /save --default-dir <dir> [--default])",
+        f"{c('/append', '1;32')}     Append last bot output to a vault file (/append <rel.md>)",
+        f"{c('/touch', '1;32')}      Create an empty vault note (/touch <rel.md>)",
         f"{c('/reset', '1;32')}      Clear local memory (runtime/history.json)",
         f"{c('/clear', '1;32')}      Clear screen",
         f"{c('/exit', '1;32')}       Exit chat",
@@ -925,14 +927,22 @@ def resolve_safe_vault_path(vault_root: Path, rel_path: PurePosixPath) -> Path:
 
 
 def append_write_audit(path: PurePosixPath, mode: str, overwritten: bool, content: str) -> None:
+    append_audit(
+        {
+            "action": "save",
+            "path": path.as_posix(),
+            "confirmMode": mode,
+            "overwritten": overwritten,
+            "bytes": len(content.encode("utf-8")),
+        }
+    )
+
+
+def append_audit(event: dict) -> None:
     payload = {
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "action": "save",
-        "path": path.as_posix(),
-        "confirmMode": mode,
-        "overwritten": overwritten,
-        "bytes": len(content.encode("utf-8")),
     }
+    payload.update(event)
     with WRITE_AUDIT_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -1083,6 +1093,104 @@ def do_save_last_response(args: list[str], state: SessionState, defaults: dict[s
     target_path.write_text(content, encoding="utf-8")
     append_write_audit(rel_path, mode, overwritten, content)
     print(c(f"meta> saved {rel_path.as_posix()}", "1;32"))
+
+
+def do_append_last_response(args: list[str], state: SessionState) -> None:
+    if not args:
+        print(c("meta> usage: /append <Research/.../file.md>", "2"))
+        return
+
+    try:
+        rel_path = sanitize_vault_relative_path(args[0], require_md=True)
+    except ValueError as exc:
+        print(c(f"meta> {exc}", "31"))
+        return
+
+    response = read_response_text()
+    if response.startswith("[bot error]"):
+        print(c("meta> cannot append: last response is an error", "31"))
+        return
+    if response.strip() == "":
+        print(c("meta> cannot append: last response is empty", "31"))
+        return
+
+    vault_root = find_vault_root_from_agent()
+    try:
+        target_path = resolve_safe_vault_path(vault_root, rel_path)
+    except ValueError as exc:
+        print(c(f"meta> {exc}", "31"))
+        return
+
+    old_text = ""
+    if target_path.exists():
+        if target_path.is_dir():
+            print(c("meta> target exists but is a directory", "31"))
+            return
+        old_text = target_path.read_text(encoding="utf-8", errors="ignore")
+
+    # Append with a separator for readability.
+    sep = "\n\n" if old_text.strip() else ""
+    new_text = old_text.rstrip("\n") + sep + response.strip() + "\n"
+
+    mode = normalize_confirm_mode(state.write_confirm_mode)
+    overwritten = target_path.exists()
+    if not confirm_write(target_path, new_text, mode):
+        print(c("meta> append cancelled", "33"))
+        return
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(new_text, encoding="utf-8")
+    append_audit(
+        {
+            "action": "append",
+            "path": rel_path.as_posix(),
+            "confirmMode": mode,
+            "overwritten": overwritten,
+            "bytes": len(new_text.encode("utf-8")),
+        }
+    )
+    print(c(f"meta> appended to {rel_path.as_posix()}", "1;32"))
+
+
+def do_touch(args: list[str], state: SessionState) -> None:
+    if not args:
+        print(c("meta> usage: /touch <Research/.../file.md>", "2"))
+        return
+
+    try:
+        rel_path = sanitize_vault_relative_path(args[0], require_md=True)
+    except ValueError as exc:
+        print(c(f"meta> {exc}", "31"))
+        return
+
+    vault_root = find_vault_root_from_agent()
+    try:
+        target_path = resolve_safe_vault_path(vault_root, rel_path)
+    except ValueError as exc:
+        print(c(f"meta> {exc}", "31"))
+        return
+
+    if target_path.exists():
+        if target_path.is_dir():
+            print(c("meta> target exists but is a directory", "31"))
+            return
+        print(c(f"meta> already exists: {rel_path.as_posix()}", "2"))
+        return
+
+    mode = normalize_confirm_mode(state.write_confirm_mode)
+    if not confirm_write(target_path, "", mode):
+        print(c("meta> touch cancelled", "33"))
+        return
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text("", encoding="utf-8")
+    append_audit(
+        {
+            "action": "touch",
+            "path": rel_path.as_posix(),
+        }
+    )
+    print(c(f"meta> created {rel_path.as_posix()}", "1;32"))
 
 
 def main() -> int:
@@ -1238,6 +1346,12 @@ def main() -> int:
 
             if cmd == "/save":
                 do_save_last_response(args, state, defaults)
+                continue
+            if cmd == "/append":
+                do_append_last_response(args, state)
+                continue
+            if cmd == "/touch":
+                do_touch(args, state)
                 continue
 
         if state.network_mode == "none" and prompt_uses_llm(text):

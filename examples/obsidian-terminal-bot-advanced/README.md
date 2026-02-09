@@ -104,6 +104,8 @@ METACLAW_BIN=/abs/path/to/metaclaw ./chat.sh
 - `/scope` or `/scope limited|all [--default]`
 - `/confirm` or `/confirm once|diff|auto [--default]`
 - `/save <Research/.../file.md>`
+- `/append <Research/.../file.md>`
+- `/touch <Research/.../file.md>`
 - `/save --default-dir <Research/...> [--default]`
 - `/reset`
 - `/model`
