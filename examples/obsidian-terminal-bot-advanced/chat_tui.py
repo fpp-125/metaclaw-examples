@@ -53,6 +53,17 @@ AGENTS_DIR = PROJECT_DIR / "agents"
 AGENTS_FILE = AGENTS_DIR / "AGENTS.md"
 SOUL_FILE = AGENTS_DIR / "soul.md"
 
+SESSION_ROOT_DIR = HOST_RUNTIME_DIR / "sessions"
+CURRENT_SESSION_FILE = HOST_CONFIG_DIR / "current_session.json"
+SESSION_MANAGED_FILES = (
+    "request.txt",
+    "response.txt",
+    "history.json",
+    "session.json",
+    "agents_context.md",
+    "last_response.md",
+)
+
 DEFAULT_METACLAW_BIN = "metaclaw"
 FALLBACK_METACLAW_BINS = (
     PROJECT_DIR / "metaclaw",
@@ -262,7 +273,10 @@ def ensure_paths() -> None:
     HOST_WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    REQUEST_FILE.touch(exist_ok=True)
+
+    # Ensure we have an active runtime session with stable symlinks:
+    # /runtime/request.txt -> /runtime/sessions/<id>/request.txt etc.
+    ensure_runtime_session()
 
     local_config_dir = PROJECT_DIR / "config"
     if local_config_dir.exists() and not any(HOST_CONFIG_DIR.iterdir()):
@@ -354,6 +368,121 @@ def normalize_tool_max_calls_per_step(value: int | str | None) -> int:
     if n > 24:
         n = 24
     return n
+
+
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,64}$")
+
+
+def sanitize_session_id(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    # Keep it filesystem-friendly and readable.
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    if not s:
+        return ""
+    if len(s) > 64:
+        s = s[:64]
+    if not _SESSION_ID_RE.match(s):
+        return ""
+    return s
+
+
+def get_current_session_id() -> str:
+    if not CURRENT_SESSION_FILE.exists():
+        return "default"
+    try:
+        payload = json.loads(CURRENT_SESSION_FILE.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return "default"
+    if not isinstance(payload, dict):
+        return "default"
+    sid = sanitize_session_id(str(payload.get("id", "")).strip())
+    return sid or "default"
+
+
+def set_current_session_id(session_id: str) -> None:
+    session_id = sanitize_session_id(session_id) or "default"
+    CURRENT_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CURRENT_SESSION_FILE.write_text(json.dumps({"id": session_id}, indent=2) + "\n", encoding="utf-8")
+
+
+def is_symlink(p: Path) -> bool:
+    try:
+        return p.is_symlink()
+    except Exception:
+        return False
+
+
+def ensure_runtime_session() -> str:
+    """Ensure runtime session directories and stable symlinks exist.
+
+    The container always reads /runtime/{request,response,history,...}. We keep those as symlinks
+    into /runtime/sessions/<id>/... so users can start a fresh session without copying projects.
+    """
+    SESSION_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+    sid = get_current_session_id()
+    activate_runtime_session(sid, migrate_existing=True)
+    return sid
+
+
+def activate_runtime_session(session_id: str, *, migrate_existing: bool) -> str:
+    sid = sanitize_session_id(session_id)
+    if not sid:
+        # Timestamp-based fallback.
+        sid = dt.datetime.now(dt.timezone.utc).strftime("s-%Y%m%dT%H%M%SZ")
+    session_dir = SESSION_ROOT_DIR / sid
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create target files first.
+    for name in SESSION_MANAGED_FILES:
+        p = session_dir / name
+        if p.exists():
+            continue
+        if name.endswith(".json"):
+            p.write_text("[]\n" if name == "history.json" else "{}\n", encoding="utf-8")
+        else:
+            p.write_text("", encoding="utf-8")
+
+    # For older projects, migrate existing non-symlink runtime files into a legacy session
+    # to avoid data loss.
+    legacy_dir: Path | None = None
+    if migrate_existing:
+        for name in SESSION_MANAGED_FILES:
+            link_path = RUNTIME_DIR / name
+            if not link_path.exists() or is_symlink(link_path):
+                continue
+            if legacy_dir is None:
+                legacy_dir = SESSION_ROOT_DIR / ("legacy-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+                legacy_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(link_path), str(legacy_dir / name))
+            except Exception:
+                # Best-effort; if move fails, leave it and proceed.
+                pass
+
+    # Point stable paths to the current session.
+    for name in SESSION_MANAGED_FILES:
+        link_path = RUNTIME_DIR / name
+        target_rel = Path("sessions") / sid / name
+        try:
+            if link_path.exists() or is_symlink(link_path):
+                link_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            link_path.symlink_to(target_rel)
+        except Exception:
+            # Symlinks may be unavailable on some systems; fall back to copying.
+            try:
+                shutil.copy2(str(session_dir / name), str(link_path))
+            except Exception:
+                pass
+
+    set_current_session_id(sid)
+    return sid
 
 
 def sanitize_default_dir(value: str) -> str:
@@ -783,8 +912,10 @@ def llm_default_display() -> str:
 
 
 def print_banner(metaclaw_bin: str, state: SessionState) -> None:
+    sid = get_current_session_id()
     rows = [
         f"{c('Project:', '1;33')} {PROJECT_DIR}",
+        f"{c('Session:', '1;33')} {sid}",
         f"{c('Agent:', '1;33')}   {AGENT_FILE.name}",
         f"{c('Runtime:', '1;33')} {get_runtime_target()}",
         f"{c('Network:', '1;33')} {network_mode_label(state.network_mode)}",
@@ -799,7 +930,7 @@ def print_banner(metaclaw_bin: str, state: SessionState) -> None:
         f"{c('Host data:', '1;33')} {HOST_DATA_DIR}",
         f"{c('MetaClaw:', '1;33')} {metaclaw_bin}",
         "",
-        f"{c('Commands:', '1;32')} /help /status /llm /history /render /focus /show /net /vault /scope /confirm /steps /calls /web /save /append /touch /reset /clear /exit",
+        f"{c('Commands:', '1;32')} /help /status /new /refresh /llm /history /render /focus /show /net /vault /scope /confirm /steps /calls /web /save /append /touch /reset /clear /exit",
     ]
     boxed("MetaClaw Obsidian Terminal Bot", rows)
 
@@ -810,6 +941,8 @@ def print_help() -> None:
         "",
         f"{c('/help', '1;32')}       Show this help",
         f"{c('/status', '1;32')}     Show runtime/key/model status",
+        f"{c('/new', '1;32')}        Start a new session (/new <name>)",
+        f"{c('/refresh', '1;32')}    Clear session context (history + cached outputs)",
         f"{c('/llm', '1;32')}        Show LLM provider/model/key status",
         f"{c('/llm setup', '1;32')}  Interactive provider/model/key setup (multi-select)",
         f"{c('/llm use', '1;32')}    Switch default provider/model",
@@ -1276,8 +1409,11 @@ def is_transient_bot_error(text: str) -> bool:
 def metaclaw_run(metaclaw_bin: str, prompt: str, state: SessionState) -> tuple[bool, float]:
     REQUEST_FILE.write_text(prompt, encoding="utf-8")
     write_session_config(state)
-    if RESPONSE_FILE.exists():
-        RESPONSE_FILE.unlink()
+    # Truncate response without unlinking (paths may be stable session symlinks).
+    try:
+        RESPONSE_FILE.write_text("", encoding="utf-8")
+    except Exception:
+        pass
 
     # Keep agent context (AGENTS.md + soul.md) synced into the mounted runtime dir.
     try:
@@ -1369,7 +1505,9 @@ def metaclaw_run(metaclaw_bin: str, prompt: str, state: SessionState) -> tuple[b
 
 
 def local_status(state: SessionState) -> None:
+    sid = get_current_session_id()
     rows = [
+        f"{c('Session:', '1;33')} {sid}",
         f"{c('Runtime target:', '1;33')} {get_runtime_target()}",
         f"{c('Network mode:', '1;33')} {network_mode_label(state.network_mode)}",
         f"{c('Vault access:', '1;33')} {vault_access_label(state.vault_access)}",
@@ -1419,11 +1557,30 @@ def show_local_history() -> None:
 
 
 def reset_memory() -> None:
-    if HISTORY_FILE.exists():
-        HISTORY_FILE.unlink()
-    if RESPONSE_FILE.exists():
-        RESPONSE_FILE.unlink()
-    print(c("meta> memory reset", "1;32"))
+    # Do not unlink runtime paths, because they may be stable session symlinks.
+    try:
+        HISTORY_FILE.write_text("[]\n", encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        RESPONSE_FILE.write_text("", encoding="utf-8")
+    except Exception:
+        pass
+    print(c("meta> memory reset (history cleared)", "1;32"))
+
+
+def refresh_context() -> None:
+    # A stronger reset for the current session: clears history, cached response, and session state.
+    try:
+        HISTORY_FILE.write_text("[]\n", encoding="utf-8")
+    except Exception:
+        pass
+    for p in (RESPONSE_FILE, REQUEST_FILE, SESSION_FILE, LAST_RESPONSE_MD_FILE, AGENTS_CONTEXT_FILE):
+        try:
+            p.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+    print(c("meta> session refreshed (context cleared)", "1;32"))
 
 
 def read_response_text() -> str:
@@ -2750,6 +2907,9 @@ def main() -> int:
         if text == "/status":
             local_status(state)
             continue
+        if text == "/refresh":
+            refresh_context()
+            continue
         if text == "/history":
             show_local_history()
             continue
@@ -2763,6 +2923,21 @@ def main() -> int:
                 continue
             cmd = tokens[0].lower()
             args = tokens[1:]
+
+            if cmd == "/new":
+                name = " ".join(args).strip() if args else ""
+                sid = sanitize_session_id(name)
+                if not sid:
+                    sid = dt.datetime.now(dt.timezone.utc).strftime("s-%Y%m%dT%H%M%SZ")
+                activate_runtime_session(sid, migrate_existing=False)
+                refresh_context()
+                print(c(f"meta> active session: {sid}", "2"))
+                print_banner(metaclaw_bin, state)
+                continue
+
+            if cmd == "/refresh":
+                refresh_context()
+                continue
 
             if cmd in {"/llm", "/model"}:
                 sub = args[0].lower() if args else ""
