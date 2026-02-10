@@ -39,12 +39,14 @@ cd examples/obsidian-terminal-bot-advanced
 # 2) build image and pin digest
 ./build_image.sh
 # 3) run chat
-export GEMINI_API_KEY=...
-export TAVILY_API_KEY=...
+export OPENAI_FORMAT_API_KEY=...
+export TAVILY_API_KEY=...   # optional
 ./chat.sh
 ```
 
-### Friend Setup (Engine + Advanced Bot)
+Tip: once in chat, run `/llm setup` to choose providers/models and (optionally) store keys into `.env` (gitignored).
+
+### Engine + Advanced Bot
 
 ```bash
 # 0) Clone both repos
@@ -77,7 +79,7 @@ RUNTIME_BIN=container ./build_image.sh
 # RUNTIME_BIN=podman ./build_image.sh
 
 # 5) Set API keys and run
-export GEMINI_API_KEY='...'
+export OPENAI_FORMAT_API_KEY='...'
 export TAVILY_API_KEY='...'   # optional
 
 METACLAW_BIN="/ABS/PATH/TO/metaclaw/metaclaw" \
@@ -92,8 +94,8 @@ If `metaclaw` is already in your `PATH`, you can omit `METACLAW_BIN=...`.
 
 ```bash
 # Replace /ABS/PATH/TO/obsidian-bot/* in agent.claw first
-export GEMINI_API_KEY=...
-metaclaw run examples/obsidian-bot/agent.claw --llm-api-key-env=GEMINI_API_KEY
+export OPENAI_FORMAT_API_KEY=...
+metaclaw run examples/obsidian-bot/agent.claw --llm-api-key-env=OPENAI_FORMAT_API_KEY
 ```
 
 ## Validate Examples

@@ -43,7 +43,7 @@ After upgrading, rebuild the image to pick up the updated `bot/` code:
 RUNTIME_BIN=container ./build_image.sh
 ```
 
-## Friend Setup (Engine + Advanced Bot)
+## Engine + Advanced Bot
 
 ```bash
 # 0) Clone both repos
@@ -118,6 +118,8 @@ METACLAW_BIN=/abs/path/to/metaclaw ./chat.sh
 
 - `/help`
 - `/status`
+- `/new <name>` (new session)
+- `/refresh` (clear current session context)
 - `/llm` (show status)
 - `/llm setup` (choose providers/models, update keys)
 - `/llm use` (switch default model)
@@ -130,6 +132,8 @@ METACLAW_BIN=/abs/path/to/metaclaw ./chat.sh
 - `/vault` or `/vault ro|rw [--default]`
 - `/scope` or `/scope limited|all [--default]`
 - `/confirm` or `/confirm once|diff|auto [--default]`
+- `/steps <n> [--default]`
+- `/calls <n> [--default]`
 - `/save <Research/.../file.md>`
 - `/append <Research/.../file.md>`
 - `/touch <Research/.../file.md>`
