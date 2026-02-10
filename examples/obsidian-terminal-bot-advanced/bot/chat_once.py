@@ -585,6 +585,8 @@ def run_tool_loop(user_prompt: str, history: list[dict], vault_context: str, web
         "- agent.spawn(name, task, model?)  # reasoning-only sub-agent (no file tools)\n\n"
         "IMPORTANT:\n"
         "- Only use paths under /vault or /workspace.\n"
+        "- For binary files (pdf/png/jpg), DO NOT use fs.read_file. Use fs.move to reorganize them.\n"
+        "- You can move entire folders using fs.move as well.\n"
         "- Prefer fs.* tools for safety; use cmd.exec only when it is clearly simpler.\n"
         "- Keep outputs concise; do not dump huge directory trees.\n\n"
         "RESPONSE FORMAT (STRICT JSON ONLY):\n"
