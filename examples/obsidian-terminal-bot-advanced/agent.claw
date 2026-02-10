@@ -33,6 +33,9 @@ agent:
       METACLAW_LOG_DIR: /logs
       METACLAW_RUNTIME_DIR: /runtime
       METACLAW_WORKSPACE_DIR: /workspace
+      # Tool-loop budgets for big vault reorganizations.
+      BOT_TOOL_MAX_STEPS: "16"
+      BOT_TOOL_MAX_CALLS_PER_STEP: "12"
       # Optional: allowlist runtime-injected web search key (host env -> container env).
       # Inject via: metaclaw run agent.claw --secret-env=TAVILY_API_KEY
       TAVILY_API_KEY: ""

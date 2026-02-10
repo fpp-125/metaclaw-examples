@@ -138,7 +138,7 @@ LLM_PROVIDER_CATALOG: dict[str, dict] = {
     },
     "anthropic": {
         "id": "anthropic",
-        "label": "Anthropic (Claude)",
+        "label": "Anthropic",
         "engineProvider": "anthropic",
         "baseURL": "https://api.anthropic.com/v1",
         "keyEnv": "ANTHROPIC_API_KEY",
@@ -1977,9 +1977,22 @@ def llm_setup_interactive() -> None:
             continue
         break
 
+    # Step 0: choose whether to edit existing selection or start fresh.
+    # A fresh start avoids the common confusion where Gemini is pre-selected.
+    mode = prompt_menu(
+        "LLM setup mode",
+        [
+            ("fresh", "start fresh (no pre-selected providers)"),
+            ("edit", "edit existing selection"),
+        ],
+        "fresh",
+    )
+    if mode is None:
+        return
+
     # Step 1: providers (multi-select)
     existing_ids = [str(p.get("id", "")).strip() for p in existing_cfg.get("providers", []) if isinstance(p, dict)]
-    initial_ids = existing_ids if LLM_CONFIG_FILE.exists() else []
+    initial_ids: list[str] = existing_ids if (mode == "edit" and LLM_CONFIG_FILE.exists()) else []
     provider_choices = llm_provider_choices(existing_cfg)
     selected_ids = prompt_multiselect("LLM providers", provider_choices, initial_ids)
     if selected_ids is None:
@@ -1995,7 +2008,8 @@ def llm_setup_interactive() -> None:
         selected_labels.append(label)
     print(c(f"meta> selected providers: {', '.join(selected_labels)}", "2"))
 
-    # Step 2: models per provider (multi-select)
+    # Step 2: models per provider (multi-select).
+    # Note: If you selected multiple providers, you'll configure them one-by-one.
     new_providers: list[dict] = []
     for i, pid in enumerate(selected_ids):
         cat = LLM_PROVIDER_CATALOG.get(pid, {})

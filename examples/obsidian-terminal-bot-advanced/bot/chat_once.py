@@ -31,7 +31,9 @@ STOPWORDS = {
     "在", "这个", "那个", "怎么", "可以", "一下", "关于", "以及", "需要", "帮我", "一个",
 }
 
-TOOL_MAX_STEPS = int(os.getenv("BOT_TOOL_MAX_STEPS", "6").strip() or "6")
+# Tool-loop budgets. Larger reorganizations (move/merge/tidy) need more than a handful of steps.
+TOOL_MAX_STEPS = int(os.getenv("BOT_TOOL_MAX_STEPS", "16").strip() or "16")
+TOOL_MAX_CALLS_PER_STEP = int(os.getenv("BOT_TOOL_MAX_CALLS_PER_STEP", "12").strip() or "12")
 TOOL_TIMEOUT_SEC = float(os.getenv("BOT_TOOL_TIMEOUT_SEC", "5").strip() or "5")
 TOOL_MAX_OUTPUT_BYTES = int(os.getenv("BOT_TOOL_MAX_OUTPUT_BYTES", "32768").strip() or "32768")
 TOOL_MAX_READ_BYTES = int(os.getenv("BOT_TOOL_MAX_READ_BYTES", "262144").strip() or "262144")
@@ -272,6 +274,47 @@ def tool_fs_touch(args: dict) -> dict:
         return {"ok": False, "error": f"touch failed: {exc}"}
     return {"ok": True, "path": str(p)}
 
+def tool_fs_mkdir(args: dict) -> dict:
+    path = str(args.get("path", "")).strip()
+    parents = bool(args.get("parents", True))
+    p = resolve_under_allowed_roots(path, for_write=True)
+    try:
+        p.mkdir(parents=parents, exist_ok=True)
+    except Exception as exc:
+        return {"ok": False, "error": f"mkdir failed: {exc}"}
+    return {"ok": True, "path": str(p)}
+
+
+def tool_fs_move(args: dict) -> dict:
+    src = str(args.get("src", "")).strip()
+    dst = str(args.get("dst", "")).strip()
+    overwrite = bool(args.get("overwrite", False))
+    create_dirs = bool(args.get("create_dirs", True))
+
+    if not src or not dst:
+        return {"ok": False, "error": "src and dst are required"}
+
+    src_path = resolve_under_allowed_roots(src, for_write=True)
+    dst_path = resolve_under_allowed_roots(dst, for_write=True)
+    if not src_path.exists():
+        return {"ok": False, "error": "src not found"}
+
+    try:
+        if create_dirs:
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+        if dst_path.exists():
+            if not overwrite:
+                return {"ok": False, "error": "dst exists (set overwrite=true to replace)"}
+            if dst_path.is_dir():
+                return {"ok": False, "error": "dst exists and is a directory (refusing to overwrite)"}
+            dst_path.unlink()
+        # pathlib.Path.rename is same-filesystem only; shutil.move works across.
+        import shutil  # local import to keep top-of-file dependencies minimal
+        shutil.move(str(src_path), str(dst_path))
+    except Exception as exc:
+        return {"ok": False, "error": f"move failed: {exc}"}
+    return {"ok": True, "src": str(src_path), "dst": str(dst_path)}
+
 
 def tool_fs_search(args: dict) -> dict:
     root = str(args.get("root", "")).strip() or "/vault"
@@ -435,6 +478,8 @@ TOOL_IMPL = {
     "fs.write_file": tool_fs_write_file,
     "fs.append_file": tool_fs_append_file,
     "fs.touch": tool_fs_touch,
+    "fs.mkdir": tool_fs_mkdir,
+    "fs.move": tool_fs_move,
     "fs.search": tool_fs_search,
     "cmd.exec": tool_cmd_exec,
     "agent.spawn": tool_agent_spawn,
@@ -534,6 +579,8 @@ def run_tool_loop(user_prompt: str, history: list[dict], vault_context: str, web
         "- fs.write_file(path, content, create_dirs=true)\n"
         "- fs.append_file(path, content, create_dirs=true)\n"
         "- fs.touch(path, create_dirs=true)\n"
+        "- fs.mkdir(path, parents=true)\n"
+        "- fs.move(src, dst, overwrite=false, create_dirs=true)\n"
         f"- cmd.exec(argv, cwd='/workspace', timeout_sec)  # allowed commands: {allowed_cmds}\n\n"
         "- agent.spawn(name, task, model?)  # reasoning-only sub-agent (no file tools)\n\n"
         "IMPORTANT:\n"
@@ -613,7 +660,8 @@ def run_tool_loop(user_prompt: str, history: list[dict], vault_context: str, web
 
         # Execute tool calls (cap per step).
         results = []
-        for call in calls[:6]:
+        max_calls = max(1, min(24, int(TOOL_MAX_CALLS_PER_STEP)))
+        for call in calls[:max_calls]:
             if not isinstance(call, dict):
                 continue
             results.append(execute_tool_call(call))
@@ -630,7 +678,13 @@ def run_tool_loop(user_prompt: str, history: list[dict], vault_context: str, web
     # Step limit hit.
     return (
         "I hit the maximum tool-steps limit while trying to complete your request.\n\n"
-        "Here is the last model output I saw:\n\n"
+        "How to continue:\n"
+        "- Re-run the same request with a higher step budget (recommended for big reorganizations).\n"
+        "- Or say: \"continue\" and I will proceed with the next batch.\n\n"
+        "Advanced (runtime knobs):\n"
+        "- BOT_TOOL_MAX_STEPS (default 16)\n"
+        "- BOT_TOOL_MAX_CALLS_PER_STEP (default 12)\n\n"
+        "Last model tool request (truncated):\n\n"
         + last_raw[:800]
     )
 
