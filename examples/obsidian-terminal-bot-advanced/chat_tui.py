@@ -1987,12 +1987,20 @@ def llm_setup_interactive() -> None:
     if not selected_ids:
         print(c("meta> no providers selected", "33"))
         return
+    selected_labels: list[str] = []
+    for pid in selected_ids:
+        prev = next((p for p in existing_cfg.get("providers", []) if isinstance(p, dict) and str(p.get("id", "")).strip() == pid), None)
+        cat = LLM_PROVIDER_CATALOG.get(pid, {})
+        label = (str((prev or {}).get("label", "")).strip() or str(cat.get("label", pid)).strip() or pid)
+        selected_labels.append(label)
+    print(c(f"meta> selected providers: {', '.join(selected_labels)}", "2"))
 
     # Step 2: models per provider (multi-select)
     new_providers: list[dict] = []
-    for pid in selected_ids:
+    for i, pid in enumerate(selected_ids):
         cat = LLM_PROVIDER_CATALOG.get(pid, {})
         prev = next((p for p in existing_cfg.get("providers", []) if isinstance(p, dict) and str(p.get("id", "")).strip() == pid), None)
+        label = (str((prev or {}).get("label", "")).strip() or str(cat.get("label", pid)).strip() or pid)
         models = []
         if isinstance(prev, dict) and isinstance(prev.get("models"), list):
             models.extend([str(m).strip() for m in prev["models"] if str(m).strip()])
@@ -2009,7 +2017,11 @@ def llm_setup_interactive() -> None:
         initial_sel = [m for m in prev_sel if m in models] or models[:1]
 
         model_choices = [(m, m) for m in models]
-        selected_models = prompt_multiselect(f"Models for {cat.get('label', pid)}", model_choices, initial_sel)
+        if len(selected_ids) > 1:
+            title = f"Models for {label} ({i+1}/{len(selected_ids)})"
+        else:
+            title = f"Models for {label}"
+        selected_models = prompt_multiselect(title, model_choices, initial_sel)
         if selected_models is None:
             return
         if not selected_models:
@@ -2017,7 +2029,7 @@ def llm_setup_interactive() -> None:
             return
 
         # Optional custom additions.
-        extra = input(c(f"meta> add custom models for {cat.get('label', pid)} (comma separated, optional): ", "2")).strip()
+        extra = input(c(f"meta> add custom models for {label} (comma separated, optional): ", "2")).strip()
         extra_models = [x.strip() for x in extra.split(",") if x.strip()] if extra else []
         for m in extra_models:
             if m not in models:
@@ -2028,7 +2040,7 @@ def llm_setup_interactive() -> None:
         new_providers.append(
             {
                 "id": pid,
-                "label": (str((prev or {}).get("label", "")).strip() or str(cat.get("label", pid)).strip() or pid),
+                "label": label,
                 "engineProvider": (str((prev or {}).get("engineProvider", "")).strip() or str(cat.get("engineProvider", "")).strip()),
                 "baseURL": (str((prev or {}).get("baseURL", "")).strip() or str(cat.get("baseURL", "")).strip()),
                 "keyEnv": (str((prev or {}).get("keyEnv", "")).strip() or str(cat.get("keyEnv", "")).strip()),
