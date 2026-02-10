@@ -1494,11 +1494,26 @@ def render_mode_demo(render_mode: str) -> str:
 
 
 def parse_command_tokens(text: str) -> list[str]:
+    # /web frequently includes apostrophes (today's) which should NOT behave like shell quoting.
+    # Handle it as a raw command early to avoid shlex errors.
+    if text.startswith("/web "):
+        return ["/web", text[len("/web ") :].strip()]
     try:
         return shlex.split(text)
     except Exception as exc:
-        print(c(f"meta> command parse error: {exc}", "31"))
-        return []
+        # Fallback: keep the first token as the command, and treat the rest as raw text.
+        # This makes commands resilient to unbalanced quotes in user prompts.
+        stripped = (text or "").strip()
+        if not stripped.startswith("/"):
+            print(c(f"meta> command parse error: {exc}", "31"))
+            return []
+        parts = stripped.split(maxsplit=1)
+        if not parts:
+            print(c(f"meta> command parse error: {exc}", "31"))
+            return []
+        if len(parts) == 1:
+            return [parts[0]]
+        return [parts[0], parts[1]]
 
 
 def parse_value_and_default(tokens: list[str]) -> tuple[str | None, bool]:
