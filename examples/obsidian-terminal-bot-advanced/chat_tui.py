@@ -75,6 +75,9 @@ DEFAULT_VALUES = {
     # - end: open a pager at the bottom
     # - input: keep you at the prompt; store response for `/show`
     "output_focus": "start",
+    # Tool-loop budgets (container-side env). Larger reorganizations need more steps.
+    "tool_max_steps": 16,
+    "tool_max_calls_per_step": 12,
 }
 
 NETWORK_CHOICES = [
@@ -162,6 +165,8 @@ class SessionState:
     write_confirm_mode: str
     save_default_dir: str
     output_focus: str
+    tool_max_steps: int
+    tool_max_calls_per_step: int
 
 
 def supports_color() -> bool:
@@ -327,6 +332,30 @@ def normalize_focus(value: str) -> str:
     return v
 
 
+def normalize_tool_max_steps(value: int | str | None) -> int:
+    try:
+        n = int(str(value).strip())
+    except Exception:
+        n = int(DEFAULT_VALUES["tool_max_steps"])
+    if n < 1:
+        n = 1
+    if n > 128:
+        n = 128
+    return n
+
+
+def normalize_tool_max_calls_per_step(value: int | str | None) -> int:
+    try:
+        n = int(str(value).strip())
+    except Exception:
+        n = int(DEFAULT_VALUES["tool_max_calls_per_step"])
+    if n < 1:
+        n = 1
+    if n > 24:
+        n = 24
+    return n
+
+
 def sanitize_default_dir(value: str) -> str:
     cleaned = sanitize_vault_relative_path(value, require_md=False)
     first = cleaned.parts[0] if cleaned.parts else ""
@@ -369,6 +398,10 @@ def load_defaults() -> dict[str, str]:
             out["save_default_dir"] = sanitize_default_dir(payload["save_default_dir"])
         if isinstance(payload.get("output_focus"), str):
             out["output_focus"] = normalize_focus(payload["output_focus"])
+        if payload.get("tool_max_steps") is not None:
+            out["tool_max_steps"] = normalize_tool_max_steps(payload.get("tool_max_steps"))
+        if payload.get("tool_max_calls_per_step") is not None:
+            out["tool_max_calls_per_step"] = normalize_tool_max_calls_per_step(payload.get("tool_max_calls_per_step"))
     except Exception:
         return dict(DEFAULT_VALUES)
     return out
@@ -383,6 +416,8 @@ def save_defaults(values: dict[str, str]) -> None:
         "write_confirm_mode": normalize_confirm_mode(values.get("write_confirm_mode", DEFAULT_VALUES["write_confirm_mode"])),
         "save_default_dir": sanitize_default_dir(values.get("save_default_dir", DEFAULT_VALUES["save_default_dir"])),
         "output_focus": normalize_focus(values.get("output_focus", DEFAULT_VALUES["output_focus"])),
+        "tool_max_steps": normalize_tool_max_steps(values.get("tool_max_steps", DEFAULT_VALUES["tool_max_steps"])),
+        "tool_max_calls_per_step": normalize_tool_max_calls_per_step(values.get("tool_max_calls_per_step", DEFAULT_VALUES["tool_max_calls_per_step"])),
     }
     DEFAULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     DEFAULTS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -764,7 +799,7 @@ def print_banner(metaclaw_bin: str, state: SessionState) -> None:
         f"{c('Host data:', '1;33')} {HOST_DATA_DIR}",
         f"{c('MetaClaw:', '1;33')} {metaclaw_bin}",
         "",
-        f"{c('Commands:', '1;32')} /help /status /llm /history /render /focus /show /net /vault /scope /confirm /save /append /touch /reset /clear /exit",
+        f"{c('Commands:', '1;32')} /help /status /llm /history /render /focus /show /net /vault /scope /confirm /steps /calls /web /save /append /touch /reset /clear /exit",
     ]
     boxed("MetaClaw Obsidian Terminal Bot", rows)
 
@@ -787,6 +822,9 @@ def print_help() -> None:
         f"{c('/vault', '1;32')}      Show or set vault access (/vault ro|rw [--default])",
         f"{c('/scope', '1;32')}      Show or set retrieval scope (/scope limited|all [--default])",
         f"{c('/confirm', '1;32')}    Show or set write confirm mode (/confirm once|diff|auto [--default])",
+        f"{c('/steps', '1;32')}      Set tool max steps (/steps 16 [--default])",
+        f"{c('/calls', '1;32')}      Set tool max calls per step (/calls 12 [--default])",
+        f"{c('/web', '1;32')}        Force Tavily web lookup (/web <query>)",
         f"{c('/save', '1;32')}       Save last bot output to vault (/save <rel.md> | /save --default-dir <dir> [--default])",
         f"{c('/append', '1;32')}     Append last bot output to a vault file (/append <rel.md>)",
         f"{c('/touch', '1;32')}      Create an empty vault note (/touch <rel.md>)",
@@ -798,7 +836,7 @@ def print_help() -> None:
         "h/l move focus, space or Enter select, q/ESC cancel",
         "",
         "Web search usage:",
-        "/web <query>  force Tavily web lookup + summarize",
+        "/web <query>  force Tavily web lookup + summarize (requires /net out + TAVILY_API_KEY)",
         "",
         "Runtime override example:",
         "RUNTIME_TARGET=auto ./chat.sh",
@@ -1119,7 +1157,70 @@ def rewrite_llm_block(agent_text: str, attempt: dict) -> str:
     return "\n".join(lines)
 
 
-def write_effective_agent(network_mode: str, vault_access: str, *, llm_attempt: dict | None) -> Path:
+def set_habitat_env_kv(agent_text: str, key: str, value: str) -> str:
+    """Best-effort YAML rewrite for agent.habitat.env KEY: VALUE (no YAML parser dependency)."""
+    lines = agent_text.splitlines()
+    in_habitat = False
+    in_env = False
+    habitat_indent = 0
+    env_indent = 0
+    env_line_idx: int | None = None
+    found_key = False
+
+    def indent_len(s: str) -> int:
+        return len(s) - len(s.lstrip(" \t"))
+
+    for i, line in enumerate(lines):
+        trimmed = line.strip()
+        indent = indent_len(line)
+
+        if trimmed == "habitat:":
+            in_habitat = True
+            habitat_indent = indent
+            in_env = False
+            continue
+        if in_habitat and indent <= habitat_indent and trimmed and not trimmed.startswith("#"):
+            in_habitat = False
+            in_env = False
+
+        if in_habitat and trimmed == "env:":
+            in_env = True
+            env_indent = indent
+            env_line_idx = i
+            continue
+        if in_env and indent <= env_indent and trimmed and not trimmed.startswith("#"):
+            in_env = False
+
+        if not in_env:
+            continue
+
+        m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
+        if not m:
+            continue
+        if m.group(1) == key:
+            prefix = line[:indent]
+            lines[i] = prefix + f"{key}: {value}"
+            found_key = True
+            break
+
+    if env_line_idx is None:
+        return agent_text
+
+    if not found_key:
+        insert_at = env_line_idx + 1
+        indent = " " * (env_indent + 2)
+        lines = lines[:insert_at] + [indent + f"{key}: {value}"] + lines[insert_at:]
+    return "\n".join(lines)
+
+
+def write_effective_agent(
+    network_mode: str,
+    vault_access: str,
+    *,
+    llm_attempt: dict | None,
+    tool_max_steps: int,
+    tool_max_calls_per_step: int,
+) -> Path:
     raw = AGENT_FILE.read_text(encoding="utf-8")
     if network_mode == "none":
         updated = raw.replace("mode: outbound", "mode: none", 1)
@@ -1132,6 +1233,13 @@ def write_effective_agent(network_mode: str, vault_access: str, *, llm_attempt: 
     updated = set_mount_readonly_by_target(updated, "/vault", normalize_vault_access(vault_access) == "ro")
     if llm_attempt is not None and llm_attempt.get("providerId") != "legacy":
         updated = rewrite_llm_block(updated, llm_attempt)
+    # Tool-loop budgets are container-side env vars.
+    updated = set_habitat_env_kv(updated, "BOT_TOOL_MAX_STEPS", f"\"{normalize_tool_max_steps(tool_max_steps)}\"")
+    updated = set_habitat_env_kv(
+        updated,
+        "BOT_TOOL_MAX_CALLS_PER_STEP",
+        f"\"{normalize_tool_max_calls_per_step(tool_max_calls_per_step)}\"",
+    )
 
     EFFECTIVE_AGENT_FILE.write_text(updated, encoding="utf-8")
     return EFFECTIVE_AGENT_FILE
@@ -1204,7 +1312,13 @@ def metaclaw_run(metaclaw_bin: str, prompt: str, state: SessionState) -> tuple[b
     for i, attempt in enumerate(attempts):
         key_env = pick_first_set_env_key(attempt) or get_key_env_name()
         llm_override = attempt if LLM_CONFIG_FILE.exists() and attempt.get("providerId") != "legacy" else None
-        agent_file = write_effective_agent(state.network_mode, state.vault_access, llm_attempt=llm_override)
+        agent_file = write_effective_agent(
+            state.network_mode,
+            state.vault_access,
+            llm_attempt=llm_override,
+            tool_max_steps=state.tool_max_steps,
+            tool_max_calls_per_step=state.tool_max_calls_per_step,
+        )
 
         run_args = [
             metaclaw_bin,
@@ -1263,6 +1377,7 @@ def local_status(state: SessionState) -> None:
         f"{c('Confirm mode:', '1;33')} {confirm_mode_label(state.write_confirm_mode)}",
         f"{c('Render mode:', '1;33')} {state.render_mode}" + (" (glow ready)" if has_glow() else " (glow missing)"),
         f"{c('Focus mode:', '1;33')} {focus_label(state.output_focus)}",
+        f"{c('Tool budget:', '1;33')} steps={state.tool_max_steps} calls/step={state.tool_max_calls_per_step}",
         f"{c('Save default dir:', '1;33')} {state.save_default_dir}",
         f"{c('LLM default:', '1;33')} {llm_default_display()}",
         f"{c('LLM key env:', '1;33')} {get_key_env_name()} {'(set)' if key_is_ready() else '(missing)'}",
@@ -1397,6 +1512,21 @@ def parse_value_and_default(tokens: list[str]) -> tuple[str | None, bool]:
             out.append(token)
     value = out[0] if out else None
     return value, persist
+
+
+def prompt_int(title: str, *, current: int, min_value: int, max_value: int) -> int | None:
+    raw = input(c(f"{title} [{current}]: ", "2")).strip()
+    if raw == "":
+        return current
+    try:
+        n = int(raw)
+    except Exception:
+        print(c("meta> invalid number", "31"))
+        return None
+    if n < min_value or n > max_value:
+        print(c(f"meta> out of range ({min_value}-{max_value})", "31"))
+        return None
+    return n
 
 
 def prompt_select(title: str, choices: list[tuple[str, str]], current_value: str) -> str | None:
@@ -2561,6 +2691,10 @@ def main() -> int:
         write_confirm_mode=normalize_confirm_mode(defaults["write_confirm_mode"]),
         save_default_dir=sanitize_default_dir(defaults["save_default_dir"]),
         output_focus=normalize_focus(defaults.get("output_focus", DEFAULT_VALUES["output_focus"])),
+        tool_max_steps=normalize_tool_max_steps(defaults.get("tool_max_steps", DEFAULT_VALUES["tool_max_steps"])),
+        tool_max_calls_per_step=normalize_tool_max_calls_per_step(
+            defaults.get("tool_max_calls_per_step", DEFAULT_VALUES["tool_max_calls_per_step"])
+        ),
     )
 
     # Environment overrides are session-only.
@@ -2568,6 +2702,10 @@ def main() -> int:
     state.render_mode = normalize_render_mode(os.getenv("BOT_RENDER_MODE", state.render_mode))
     state.vault_access = normalize_vault_access(os.getenv("BOT_VAULT_ACCESS", state.vault_access))
     state.output_focus = normalize_focus(os.getenv("BOT_OUTPUT_FOCUS", state.output_focus))
+    state.tool_max_steps = normalize_tool_max_steps(os.getenv("BOT_TOOL_MAX_STEPS", state.tool_max_steps))
+    state.tool_max_calls_per_step = normalize_tool_max_calls_per_step(
+        os.getenv("BOT_TOOL_MAX_CALLS_PER_STEP", state.tool_max_calls_per_step)
+    )
 
     print_banner(metaclaw_bin, state)
 
@@ -2746,6 +2884,86 @@ def main() -> int:
                     print(c("meta> usage: /confirm once|diff|auto [--default]", "31"))
                     continue
                 apply_mode_change(state, defaults, "write_confirm_mode", selected, persist)
+                continue
+
+            if cmd == "/steps":
+                value, persist = parse_value_and_default(args)
+                if value is None:
+                    n = prompt_int("Tool max steps", current=state.tool_max_steps, min_value=1, max_value=128)
+                else:
+                    try:
+                        n = int(value)
+                    except Exception:
+                        n = None
+                if n is None:
+                    print(c("meta> usage: /steps <n> [--default]", "31"))
+                    continue
+                state.tool_max_steps = normalize_tool_max_steps(n)
+                print(c(f"meta> tool_max_steps set to {state.tool_max_steps}", "1;32"))
+                if persist:
+                    defaults["tool_max_steps"] = state.tool_max_steps
+                    save_defaults(defaults)
+                    print(c("meta> saved as project default", "2"))
+                continue
+
+            if cmd == "/calls":
+                value, persist = parse_value_and_default(args)
+                if value is None:
+                    n = prompt_int(
+                        "Tool max calls per step",
+                        current=state.tool_max_calls_per_step,
+                        min_value=1,
+                        max_value=24,
+                    )
+                else:
+                    try:
+                        n = int(value)
+                    except Exception:
+                        n = None
+                if n is None:
+                    print(c("meta> usage: /calls <n> [--default]", "31"))
+                    continue
+                state.tool_max_calls_per_step = normalize_tool_max_calls_per_step(n)
+                print(c(f"meta> tool_max_calls_per_step set to {state.tool_max_calls_per_step}", "1;32"))
+                if persist:
+                    defaults["tool_max_calls_per_step"] = state.tool_max_calls_per_step
+                    save_defaults(defaults)
+                    print(c("meta> saved as project default", "2"))
+                continue
+
+            if cmd == "/web":
+                query = " ".join(args).strip()
+                if not query:
+                    print(c("meta> usage: /web <query>", "31"))
+                    continue
+                web_env = get_web_key_env_name()
+                if not os.getenv(web_env):
+                    print(c(f"meta> missing web search key env: {web_env}", "33"))
+                    print(c(f"meta> set it to enable Tavily: export {web_env}=your_key", "2"))
+                    continue
+
+                # Web lookup requires outbound, but keep your session default unchanged.
+                prev_mode = state.network_mode
+                state.network_mode = "outbound"
+                try:
+                    web_prompt = "/web " + query
+                    if not check_key_env_or_warn(web_prompt):
+                        continue
+                    ok, elapsed = metaclaw_run(metaclaw_bin, web_prompt, state)
+                    if not ok:
+                        print(c("bot> run failed", "31"))
+                        for line in tail_log(RUN_LOG_FILE, n=40):
+                            print(f"  {line}")
+                        response_text = read_response_text()
+                        if response_text.startswith("[bot error]"):
+                            print(f"  {response_text}")
+                        continue
+                    response_text = read_response_text()
+                    used_mode = present_bot_response(response_text, elapsed, state)
+                    if state.render_mode == "glow" and looks_like_markdown(response_text) and used_mode != state.render_mode:
+                        print(c(f"\nmeta> glow render failed, used {used_mode}", "33"))
+                finally:
+                    state.network_mode = prev_mode
                 continue
 
             if cmd == "/save":
